@@ -39,7 +39,7 @@ pub mod id;
 pub mod node;
 pub mod source;
 
-pub use community::{Partition, louvain, louvain_seeded, modularity};
+pub use community::{Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity};
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
 pub use id::Uuid7;

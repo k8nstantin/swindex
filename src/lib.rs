@@ -12,10 +12,11 @@
 //! exhibit emergent small-world structure.
 //!
 //! See [`DESIGN.md`](https://github.com/k8nstantin/swindex/blob/main/DESIGN.md)
-//! in the repository root for the full design document. This is v0.0.5 —
+//! in the repository root for the full design document. This is v0.0.8 —
 //! core types, the [`GraphSource`] boundary, a GML loader, an in-memory
-//! [`Graph`], and Louvain community detection. Hub detection, persistence,
-//! and the query planner land in subsequent releases.
+//! [`Graph`], Louvain & Leiden community detection, and degree-based hub
+//! detection. Approximate betweenness centrality, the hub graph,
+//! persistence, and the query planner land in subsequent releases.
 //!
 //! # Module map
 //!
@@ -26,15 +27,17 @@
 //! * [`gml`] — [`gml::GmlSource`], a loader for academic GML files
 //!   (Zachary, SNAP datasets, NetworkX exports). Implements [`GraphSource`].
 //! * [`graph`] — [`Graph`], an in-memory undirected/weighted graph built
-//!   from any [`GraphSource`]. The substrate the clustering algorithms
-//!   actually walk.
+//!   from any [`GraphSource`]. The substrate the algorithms walk.
 //! * [`community`] — [`community::Partition`], [`community::modularity`],
-//!   and Louvain (the first community-detection algorithm) — produces
-//!   modularity ≥ 0.3 on Zachary karate. Leiden refinement lands next.
+//!   Louvain and Leiden community detection. Produces Q ≈ 0.42 on
+//!   Zachary karate with provably-connected communities.
+//! * [`hub`] — [`hub::HubSet`], degree-based hub identification. The
+//!   Layer-2 structure swindex routes queries through.
 
 pub mod community;
 pub mod gml;
 pub mod graph;
+pub mod hub;
 pub mod id;
 pub mod node;
 pub mod source;
@@ -42,6 +45,7 @@ pub mod source;
 pub use community::{Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity};
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
+pub use hub::HubSet;
 pub use id::Uuid7;
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use source::{GraphSource, SliceSource};

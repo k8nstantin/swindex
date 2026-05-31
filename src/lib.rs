@@ -6,14 +6,17 @@
 //! exhibit emergent small-world structure.
 //!
 //! See `small-world-index.md` in the repository root for the full design
-//! document. This is v0.0.2 — core identity and node/edge types only. Index
-//! algorithms (Leiden, hubs, persistence, query) land in subsequent releases.
+//! document. This is v0.0.3 — core types and the [`GraphSource`] boundary.
+//! Index algorithms (Leiden, hubs, persistence, query) land in subsequent
+//! releases.
 
 pub mod id;
 pub mod node;
+pub mod source;
 
 pub use id::Uuid7;
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+pub use source::{GraphSource, SliceSource};
 
 /// Returns the crate version as declared in `Cargo.toml`.
 #[must_use]

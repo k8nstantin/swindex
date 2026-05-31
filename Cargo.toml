@@ -1,0 +1,20 @@
+[package]
+name = "swindex"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Hierarchical small-world property-graph index — Leiden communities + hub-aware navigation + incremental maintenance."
+repository = "https://github.com/k8nstantin/swindex"
+license = "Apache-2.0"
+readme = "README.md"
+categories = ["data-structures", "algorithms", "database"]
+keywords = ["graph", "index", "leiden", "small-world", "hnsw"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

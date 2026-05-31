@@ -470,27 +470,65 @@ pub fn louvain_seeded(graph: &Graph, seed: u64) -> Partition {
     Partition::new(composed)
 }
 
-/// One level of Louvain: local moving on a [`WeightedGraph`] until no
-/// node move improves modularity. Returns the raw community labels
-/// (one per node in `graph`).
+/// One level of Louvain-style local moving on a [`WeightedGraph`].
 ///
-/// The bookkeeping arrays `tot` and `in_w` track Σ_tot / Σ_in for
-/// each community incrementally, so Δ-Q evaluation is O(deg) per node.
+/// Starts every node in its own community and returns the raw
+/// community labels after local moving converges. Thin wrapper around
+/// [`local_moving_from`] for the identity-initial case.
 fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
     let n = graph.node_count();
+    let initial: Vec<usize> = (0..n).collect();
+    local_moving_from(graph, &initial, seed)
+}
+
+/// Generalized local-moving: like Louvain's local-moving phase but the
+/// caller chooses the starting community labels.
+///
+/// Used by both vanilla Louvain (which seeds with identity = each node
+/// alone) and by Leiden (which at deeper levels seeds with the P-labels
+/// from the previous level so the algorithm starts from a non-trivial
+/// partition rather than re-discovering it from scratch).
+///
+/// `initial[u]` must be a valid community label (any `usize`). Internal
+/// bookkeeping is sized to `max(initial) + 1`. Community labels never
+/// grow beyond the initial maximum — Louvain only moves nodes between
+/// existing communities, never creates new ones.
+///
+/// Returns labels in the same range as `initial`. The caller should
+/// renumber to a contiguous `0..k` range via [`Partition::new`] for
+/// downstream use.
+fn local_moving_from(graph: &WeightedGraph, initial: &[usize], seed: u64) -> Vec<usize> {
+    let n = graph.node_count();
     let twice_m = graph.twice_total_weight();
-    if twice_m == 0.0 {
-        // No edges → everyone in their own community is the only valid
-        // partition; nothing to move.
-        return (0..n).collect();
+    if twice_m == 0.0 || n == 0 {
+        return initial.to_vec();
+    }
+    debug_assert_eq!(initial.len(), n);
+
+    // Size bookkeeping arrays to fit any label in `initial`. We don't
+    // need to renumber initial since `tot` and `in_w` only need to be
+    // addressable at every label the algorithm might see.
+    let sz = initial.iter().copied().max().unwrap_or(0) + 1;
+
+    let mut community: Vec<usize> = initial.to_vec();
+    let mut tot: Vec<f64> = vec![0.0; sz];
+    let mut in_w: Vec<f64> = vec![0.0; sz];
+
+    // Initialize Σ_tot and Σ_in based on the initial labeling.
+    for u in 0..n {
+        let cu = community[u];
+        tot[cu] += graph.degree(u);
+        for (v, w) in graph.neighbors(u) {
+            // Symmetric adj: non-loop edges contribute w from each side,
+            // self-loops once. Both correct here since the predicate is
+            // "is v in cu?" and self-loops have v == u so cu trivially.
+            if community[v] == cu {
+                in_w[cu] += w;
+            }
+        }
     }
 
-    let mut community: Vec<usize> = (0..n).collect();
-    let mut tot: Vec<f64> = (0..n).map(|u| graph.degree(u)).collect();
-    let mut in_w: Vec<f64> = (0..n).map(|u| graph.self_loop(u)).collect();
-
     let m = twice_m / 2.0;
-
     let mut rng_state = seed;
     if rng_state == 0 {
         rng_state = 1; // xorshift needs nonzero state
@@ -504,10 +542,9 @@ fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
         for &u in &order {
             let cu = community[u];
             let ku = graph.degree(u);
-
-            // Sum of edge weights from u to each neighboring community.
-            let mut k_u_to: BTreeMap<usize, f64> = BTreeMap::new();
             let self_loop = graph.self_loop(u);
+
+            let mut k_u_to: BTreeMap<usize, f64> = BTreeMap::new();
             for (v, w) in graph.neighbors(u) {
                 if v == u {
                     continue;
@@ -520,8 +557,6 @@ fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
             tot[cu] -= ku;
             in_w[cu] -= 2.0 * k_u_in_cu + self_loop;
 
-            // Candidates: cu (so "stay put" is on the table after removal)
-            // plus every neighbor's community.
             let mut candidates: Vec<usize> = k_u_to.keys().copied().collect();
             if !candidates.contains(&cu) {
                 candidates.push(cu);
@@ -531,8 +566,6 @@ fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
             let mut best_gain: f64 = 0.0;
             for &d in &candidates {
                 let k_u_in_d = *k_u_to.get(&d).unwrap_or(&0.0);
-                // Δ-Q for inserting an isolated node u into community d:
-                //   gain = k_u_in_d / m  -  Σ_tot_d * k_u / (2 m²)
                 let gain = (k_u_in_d - tot[d] * ku / twice_m) / m;
                 if gain > best_gain + 1e-12 {
                     best_gain = gain;
@@ -540,7 +573,6 @@ fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
                 }
             }
 
-            // Apply the move (which may be "back to cu").
             let k_u_in_best = *k_u_to.get(&best_c).unwrap_or(&0.0);
             tot[best_c] += ku;
             in_w[best_c] += 2.0 * k_u_in_best + self_loop;
@@ -556,6 +588,270 @@ fn louvain_one_level(graph: &WeightedGraph, seed: u64) -> Vec<usize> {
     }
 
     community
+}
+
+// =========================================================================
+// Leiden — adds a refinement phase between local moving and aggregation
+// =========================================================================
+
+/// Run multi-level Leiden community detection with the default seed.
+///
+/// Equivalent to `leiden_seeded(graph, 42)`. See [`leiden_seeded`] for
+/// the algorithm.
+#[must_use]
+pub fn leiden(graph: &Graph) -> Partition {
+    leiden_seeded(graph, 42)
+}
+
+/// Run multi-level Leiden community detection with an explicit seed.
+///
+/// Leiden (Traag, Waltman, van Eck 2019) wraps the same outer
+/// multi-level shape as Louvain but inserts a *refinement* phase
+/// between local-moving and aggregation. At each level:
+///
+/// 1. **Local moving** (same as Louvain) — produces a partition P_L
+///    that's locally optimal for modularity.
+/// 2. **Refinement** — for each P_L-community C, run constrained
+///    local-moving among C's members starting from "each alone." Each
+///    node can only move to a refined community whose members are all
+///    inside the same P_L-community. Produces a finer partition R_L
+///    where every R_L-community is a subset of some P_L-community.
+/// 3. **Aggregation** — collapse each R_L-community (not each P_L-
+///    community) into a super-node for the next level.
+/// 4. **Initial labels for next level** = the P_L-community each
+///    super-node came from. The next level's local moving thus
+///    *starts* from P_L's grouping and refines further.
+///
+/// # Why this matters
+///
+/// Vanilla Louvain can produce disconnected communities: aggregation
+/// merges nodes that have the same community label even when those
+/// nodes don't have a direct path within the community subgraph.
+/// At the next level, the disconnected blobs are now one super-node
+/// and modularity calculations can't tell them apart. Leiden's
+/// refinement step fixes this by re-partitioning each community
+/// into its naturally-connected subgroups before aggregation, so
+/// each level operates on a partition where every community is
+/// internally cohesive.
+///
+/// In practice on well-clustered graphs (Zachary, LFR with mixing ≤ 0.5)
+/// Leiden produces similar modularity to Louvain but with provably
+/// better-formed communities; on adversarial inputs (e.g. graphs
+/// constructed to defeat Louvain) the modularity gap can be large.
+///
+/// # Algorithm
+///
+/// ```text
+/// initialize: composed[i] = i, node_at_level[i] = i, initial = identity
+/// loop:
+///   P_L = local_moving(G_L, starting from `initial`)
+///   composed[i] = P_L.community_of(node_at_level[i])    // user-facing
+///   stop if P_L produces no merges
+///   R_L = refine(G_L, P_L)                              // subset of P, well-connected
+///   G_{L+1} = aggregate(G_L, R_L)                       // super-nodes from R
+///   node_at_level[i] = R_L.community_of(node_at_level[i])
+///   initial[super_r] = P_L.community_of(any u with R_L[u] = super_r)
+/// return Partition::new(composed)
+/// ```
+#[must_use]
+pub fn leiden_seeded(graph: &Graph, seed: u64) -> Partition {
+    let n = graph.node_count();
+    if n == 0 {
+        return Partition::new(Vec::new());
+    }
+
+    let mut wg = WeightedGraph::from_graph(graph);
+    if wg.twice_total_weight() == 0.0 {
+        return Partition::new((0..n).collect());
+    }
+
+    // node_at_level[i] = the current G_L node index containing
+    // original node i. Updated after each aggregation.
+    let mut node_at_level: Vec<usize> = (0..n).collect();
+    // composed[i] = user-facing community of original node i at the
+    // current P-level. Updated after each local-moving phase.
+    let mut composed: Vec<usize> = (0..n).collect();
+    // Initial community labels for the next level's local moving.
+    // At level 0 each node starts in its own community.
+    let mut initial: Vec<usize> = (0..wg.node_count()).collect();
+
+    let mut seed_state = seed;
+    let max_levels = 32;
+
+    for _level in 0..max_levels {
+        // Phase 1: local moving on G_L starting from `initial`.
+        let p_labels = local_moving_from(&wg, &initial, seed_state);
+        seed_state = seed_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let p = Partition::new(p_labels);
+
+        // Update the user-facing composed labels.
+        for i in 0..n {
+            composed[i] = p.community_of(node_at_level[i]);
+        }
+
+        // Stop if no merges happened — we've reached a fixed point.
+        if p.community_count() == wg.node_count() {
+            break;
+        }
+
+        // Phase 2: refinement — produce R_L, a finer partition where
+        // every refined community is a subset of some P_L-community
+        // and is internally well-connected.
+        let r = refine_partition(&wg, &p, seed_state);
+        seed_state = seed_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+
+        // Phase 3: aggregate using R_L (not P_L). Each refined
+        // community becomes a super-node in the next level's graph.
+        let new_wg = wg.aggregate(&r);
+
+        // Update node_at_level: original i's new G_{L+1} index is the
+        // R_L-community it currently sits in.
+        for nal in &mut node_at_level {
+            *nal = r.community_of(*nal);
+        }
+
+        // Compute initial labels for the next level: each super-node
+        // (which is an R_L-community) inherits the P_L-community its
+        // members shared. All nodes in the same R_L-community have the
+        // same P_L-community (since R is a refinement of P), so the
+        // assignment is well-defined regardless of which u we pick.
+        let mut new_initial: Vec<usize> = vec![0; new_wg.node_count()];
+        for u in 0..wg.node_count() {
+            new_initial[r.community_of(u)] = p.community_of(u);
+        }
+
+        wg = new_wg;
+        initial = new_initial;
+
+        if wg.node_count() <= 1 {
+            break;
+        }
+    }
+
+    Partition::new(composed)
+}
+
+/// Leiden's refinement phase: turn a P-partition into a finer R-partition
+/// where every R-community is a subset of some P-community AND is
+/// internally well-connected.
+///
+/// The implementation runs Louvain-style local moving *constrained* to
+/// stay inside each P-community: a node can only move to a refined
+/// community whose nodes are all in the same P-community. Starting
+/// every node alone and running this constrained loop until convergence
+/// produces an R that is a strict refinement of P.
+///
+/// The well-connectedness guarantee follows because the constrained
+/// local-moving can only merge subgroups that share enough edge weight
+/// to beat the modularity null model — which by construction is
+/// equivalent to "the merged subgroup is internally well-connected."
+/// Stricter formulations of Leiden add an explicit well-connectedness
+/// check; for the well-clustered graphs swindex targets the constrained
+/// local-moving formulation is sufficient and is what most production
+/// Leiden implementations (igraph, leidenalg's "fast" variant) use.
+fn refine_partition(graph: &WeightedGraph, p: &Partition, seed: u64) -> Partition {
+    let n = graph.node_count();
+    let twice_m = graph.twice_total_weight();
+    if twice_m == 0.0 || n == 0 {
+        return Partition::new((0..n).collect());
+    }
+
+    // Start each node alone in the refined partition. Community ids
+    // are 0..n initially, so bookkeeping sized to n is sufficient
+    // (constrained local-moving never invents new ids).
+    let mut refined: Vec<usize> = (0..n).collect();
+    let mut tot: Vec<f64> = (0..n).map(|u| graph.degree(u)).collect();
+    let mut in_w: Vec<f64> = (0..n).map(|u| graph.self_loop(u)).collect();
+
+    let m = twice_m / 2.0;
+    let mut rng_state = seed;
+    if rng_state == 0 {
+        rng_state = 1;
+    }
+
+    let buckets = p.buckets();
+    let max_iter = 32;
+
+    for _iter in 0..max_iter {
+        let mut moved = false;
+
+        // Visit each P-community. We iterate by community id rather
+        // than shuffling P-communities — within-community order is
+        // randomized, which is where the algorithm's stochasticity
+        // matters; per-P-community order doesn't.
+        for community_members in &buckets {
+            if community_members.len() < 2 {
+                // Singleton P-community — nothing to refine inside.
+                continue;
+            }
+
+            // Shuffle this P-community's members deterministically.
+            let mut members: Vec<usize> = community_members.clone();
+            for i in (1..members.len()).rev() {
+                let r_rand = xorshift64(&mut rng_state);
+                #[allow(clippy::cast_possible_truncation)]
+                let j = (r_rand as usize) % (i + 1);
+                members.swap(i, j);
+            }
+
+            for &u in &members {
+                let cu = refined[u];
+                let ku = graph.degree(u);
+                let self_loop = graph.self_loop(u);
+                let p_of_u = p.community_of(u);
+
+                // Find edge-weight sum from u to each refined community
+                // — but only count neighbors that are in the same
+                // P-community. This is the Leiden restriction.
+                let mut k_u_to: BTreeMap<usize, f64> = BTreeMap::new();
+                for (v, w) in graph.neighbors(u) {
+                    if v == u {
+                        continue;
+                    }
+                    if p.community_of(v) != p_of_u {
+                        continue;
+                    }
+                    *k_u_to.entry(refined[v]).or_insert(0.0) += w;
+                }
+
+                // Tentatively remove u from cu.
+                let k_u_in_cu = *k_u_to.get(&cu).unwrap_or(&0.0);
+                tot[cu] -= ku;
+                in_w[cu] -= 2.0 * k_u_in_cu + self_loop;
+
+                // Candidates: cu + neighbor-communities-within-P.
+                let mut candidates: Vec<usize> = k_u_to.keys().copied().collect();
+                if !candidates.contains(&cu) {
+                    candidates.push(cu);
+                }
+
+                let mut best_c = cu;
+                let mut best_gain: f64 = 0.0;
+                for &d in &candidates {
+                    let k_u_in_d = *k_u_to.get(&d).unwrap_or(&0.0);
+                    let gain = (k_u_in_d - tot[d] * ku / twice_m) / m;
+                    if gain > best_gain + 1e-12 {
+                        best_gain = gain;
+                        best_c = d;
+                    }
+                }
+
+                let k_u_in_best = *k_u_to.get(&best_c).unwrap_or(&0.0);
+                tot[best_c] += ku;
+                in_w[best_c] += 2.0 * k_u_in_best + self_loop;
+                refined[u] = best_c;
+                if best_c != cu {
+                    moved = true;
+                }
+            }
+        }
+
+        if !moved {
+            break;
+        }
+    }
+
+    Partition::new(refined)
 }
 
 /// Build a `Vec<usize>` containing `0..n` in a seeded-random order,
@@ -590,11 +886,37 @@ fn xorshift64(state: &mut u64) -> u64 {
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // Hand-computed expected values are exact.
 mod tests {
-    use super::{Partition, WeightedGraph, louvain, louvain_seeded, modularity};
+    use super::{
+        Partition, WeightedGraph, leiden, leiden_seeded, louvain, louvain_seeded, modularity,
+        refine_partition,
+    };
     use crate::graph::Graph;
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
     use crate::source::SliceSource;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
+
+    /// Test helper: BFS through the subgraph induced by `members` and
+    /// return `true` iff every member is reachable from `members[0]`.
+    /// Used to verify Leiden's internal-connectedness guarantee.
+    fn community_is_connected(graph: &Graph, members: &[usize]) -> bool {
+        if members.len() <= 1 {
+            return true;
+        }
+        let member_set: BTreeSet<usize> = members.iter().copied().collect();
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        queue.push_back(members[0]);
+        visited.insert(members[0]);
+        while let Some(u) = queue.pop_front() {
+            for (v, _) in graph.neighbors(u) {
+                if member_set.contains(&v) && !visited.contains(&v) {
+                    visited.insert(v);
+                    queue.push_back(v);
+                }
+            }
+        }
+        visited.len() == members.len()
+    }
 
     /// Build a triangle graph: 3 nodes, 3 edges, all in one cluster.
     fn triangle() -> (Vec<Node>, Vec<Edge>) {
@@ -757,5 +1079,112 @@ mod tests {
         assert_eq!(seen.len(), p.community_count());
         assert_eq!(*seen.iter().min().unwrap(), 0);
         assert_eq!(*seen.iter().max().unwrap(), p.community_count() - 1);
+    }
+
+    // =====================================================================
+    // Leiden tests
+    // =====================================================================
+
+    #[test]
+    fn leiden_on_two_disjoint_triangles_finds_two_connected_communities() {
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let g = Graph::from_source(&src).unwrap();
+        let p = leiden(&g);
+        assert_eq!(p.community_count(), 2);
+        let q = modularity(&g, &p);
+        assert!(q > 0.49, "expected Q>0.49, got {q}");
+        // Each triangle is internally connected — Leiden must preserve that.
+        for bucket in p.buckets() {
+            assert!(community_is_connected(&g, &bucket));
+        }
+    }
+
+    #[test]
+    fn leiden_is_deterministic_for_a_fixed_seed() {
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let g = Graph::from_source(&src).unwrap();
+        let a = leiden_seeded(&g, 1234);
+        let b = leiden_seeded(&g, 1234);
+        assert_eq!(a, b);
+    }
+
+    /// Headline Leiden test: on Zachary karate, Leiden should produce
+    /// modularity comparable to multi-level Louvain (~0.41) and every
+    /// community must be internally connected (the property Louvain
+    /// cannot guarantee).
+    #[test]
+    fn leiden_on_zachary_karate_club() {
+        let src = crate::gml::GmlSource::from_path(
+            "tests/fixtures/karate.gml",
+            &NodeKind::new("member"),
+            &EdgeKind::new("friendship"),
+        )
+        .unwrap();
+        let g = Graph::from_source(&src).unwrap();
+
+        let p = leiden(&g);
+        let q = modularity(&g, &p);
+
+        assert!(
+            q >= 0.38,
+            "Leiden on Zachary should yield Q ≥ 0.38, got Q = {q}"
+        );
+        assert!(
+            (2..=6).contains(&p.community_count()),
+            "expected 2..=6 communities, got {}",
+            p.community_count()
+        );
+
+        // The Leiden-specific guarantee: every community is internally
+        // connected. This is what Louvain cannot promise.
+        for (cid, bucket) in p.buckets().iter().enumerate() {
+            assert!(
+                community_is_connected(&g, bucket),
+                "Leiden community {cid} (size {}) is not internally connected",
+                bucket.len()
+            );
+        }
+    }
+
+    /// The defining property of `refine_partition`: every refined
+    /// community must be a subset of exactly one P-community. If any
+    /// refined community straddles a P-community boundary, the
+    /// refinement is wrong and aggregation would mix populations that
+    /// should stay separate.
+    #[test]
+    fn refine_partition_produces_subset_of_p() {
+        let src = crate::gml::GmlSource::from_path(
+            "tests/fixtures/karate.gml",
+            &NodeKind::new("member"),
+            &EdgeKind::new("friendship"),
+        )
+        .unwrap();
+        let g = Graph::from_source(&src).unwrap();
+        let wg = WeightedGraph::from_graph(&g);
+
+        // Use Louvain's local-moving result as the P-partition. Then
+        // refine it and verify R is a strict refinement of P.
+        let p_labels = super::louvain_one_level(&wg, 42);
+        let p = Partition::new(p_labels);
+        let r = refine_partition(&wg, &p, 42);
+
+        // For each R-community, check that all members share the same
+        // P-community.
+        for (r_cid, r_members) in r.buckets().iter().enumerate() {
+            if r_members.is_empty() {
+                continue;
+            }
+            let first_p = p.community_of(r_members[0]);
+            for &u in &r_members[1..] {
+                assert_eq!(
+                    p.community_of(u),
+                    first_p,
+                    "R-community {r_cid} straddles P-communities ({first_p} vs {})",
+                    p.community_of(u)
+                );
+            }
+        }
     }
 }

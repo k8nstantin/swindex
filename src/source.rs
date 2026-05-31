@@ -1,44 +1,87 @@
 //! The boundary between "where the graph lives" and "the index that consumes it."
 //!
-//! A [`GraphSource`] is anything that can hand the index a stream of [`Node`]s
-//! and a stream of [`Edge`]s. The index doesn't care whether the source is a
-//! slice in memory, a GML file on disk, a `petgraph::Graph<N, E>`, or a
-//! streaming feed from an application layer — only that it can iterate them.
+//! # Why a trait, not a concrete type
 //!
-//! Two reference sources ship in the crate today:
+//! The index has to consume graphs from a wide variety of sources:
 //!
-//! - [`SliceSource`] — wraps `&[Node]` and `&[Edge]`. Used in tests and tiny
-//!   in-memory builds.
-//! - more to come in subsequent releases (`GmlSource` for SNAP datasets,
-//!   `PetgraphSource` for callers that already have an in-memory graph).
+//! * In-memory slices (tests, small fixtures)
+//! * GML / GraphML / EdgeList files on disk (SNAP datasets, NetworkX
+//!   exports, benchmark graphs)
+//! * `petgraph::Graph<N, E>` values (callers that already have a graph)
+//! * Rows streaming from a SQL cursor over MySQL / Postgres
+//! * Arrow `RecordBatch`es from Iceberg / Parquet
+//! * A live changefeed from another swindex instance (replication)
+//! * An HTTP API that yields one node-or-edge per request (rare, but
+//!   needed for some federation patterns)
 //!
-//! The trait yields owned [`Node`]/[`Edge`] values rather than references so
-//! that streaming and lazy sources (decoding off disk, materializing rows on
-//! the fly) can implement it without holding everything in memory. In-memory
-//! sources just clone — the per-node cost is dominated by Leiden's later
-//! work, so this is cheap in practice.
+//! None of these can be expressed as a single concrete type. They have
+//! different lifetimes, different error modes, different cost models for
+//! "iterate the same thing twice." A trait lets each source satisfy
+//! exactly the contract the builder needs without committing to a
+//! particular representation.
+//!
+//! # The contract
+//!
+//! [`GraphSource`] guarantees three things — see the trait doc for the
+//! exact wording. Briefly: `nodes()` yields every node exactly once,
+//! `edges()` yields every edge exactly once, and either method may be
+//! called repeatedly and produces the same sequence (modulo ordering).
+//!
+//! That third clause matters more than it looks. The build path iterates
+//! nodes once (to assign ids to clusters), then iterates edges several
+//! times (once per Leiden pass), and we cannot afford the iterator to
+//! consume an underlying stream. Sources whose backing data is a true
+//!
+//! stream (a SQL cursor, a Kafka topic) must buffer or rewind internally
+//! to satisfy the repeatability clause.
+//!
+//! # Owned values, not borrowed
+//!
+//! The trait yields owned `Node` / `Edge` values rather than references.
+//! This is a deliberate design choice — it lets streaming sources
+//! materialize values on the fly without buffering the whole graph in
+//! memory as a long-lived `Vec`. In-memory sources just clone — the
+//! per-item clone cost is negligible compared to Leiden's later work.
+//!
+//! If a hot path ever shows the clones in a profile, we can add a
+//! parallel `for_each_node` / `for_each_edge` API to the trait without
+//! breaking existing implementors.
 
 use crate::node::{Edge, Node};
 
 /// A producer of graph nodes and edges for the index to consume.
 ///
+/// # Contract
+///
 /// Implementors guarantee:
 ///
-/// 1. Calling [`Self::nodes`] yields every node in the source, exactly once,
-///    in any order.
-/// 2. Calling [`Self::edges`] yields every edge in the source, exactly once,
-///    in any order.
-/// 3. Both methods can be called more than once and produce the same sequence
-///    (up to ordering). A source that consumes its underlying stream must
-///    buffer or otherwise re-create the sequence on each call.
+/// 1. Calling [`Self::nodes`] yields every node in the source, exactly
+///    once, in any order.
+/// 2. Calling [`Self::edges`] yields every edge in the source, exactly
+///    once, in any order.
+/// 3. Either method can be called more than once and produces the same
+///    sequence (up to ordering). A source whose backing data is a true
+///    stream must buffer or rewind internally to satisfy this clause —
+///    the index builder iterates each method several times during a
+///    single build.
 ///
-/// The size hints are advisory and used to pre-size index buffers. Returning
-/// `None` is always correct; returning a tight upper bound is best.
+/// # Size hints
+///
+/// [`Self::node_count_hint`] and [`Self::edge_count_hint`] are advisory
+/// and used to pre-size the index's internal buffers. Returning `None`
+/// is always correct; returning a tight upper bound is best. The
+/// builder treats hints as `Vec::with_capacity` arguments, not as
+/// contracts — under-counting wastes a few reallocations, over-counting
+/// wastes a few bytes of memory, neither causes a bug.
 pub trait GraphSource {
     /// Iterate every node in the source.
+    ///
+    /// Must satisfy clauses (1) and (3) of the trait contract.
     fn nodes(&self) -> impl Iterator<Item = Node> + '_;
 
     /// Iterate every edge in the source.
+    ///
+    /// Must satisfy clauses (2) and (3) of the trait contract.
     fn edges(&self) -> impl Iterator<Item = Edge> + '_;
 
     /// Optional hint for the total number of nodes; defaults to `None`.
@@ -54,10 +97,17 @@ pub trait GraphSource {
 
 /// A [`GraphSource`] backed by two slices held in memory.
 ///
-/// `SliceSource` is the simplest possible source. It does not validate that
-/// edges refer to nodes that exist in the node slice; that's the index
-/// builder's responsibility (a later PR will surface dangling-edge errors at
-/// build time).
+/// `SliceSource` is the simplest possible source — it stores nothing,
+/// owns nothing, just borrows two slices and exposes them as a
+/// `GraphSource`. Used in unit tests, small examples, and any case
+/// where the caller already has the full graph in memory and just
+/// wants to feed it to the builder.
+///
+/// **Validation:** `SliceSource` does *not* check that every edge's
+/// `source`/`target` ids appear in the node slice. That validation is
+/// the index builder's responsibility — when the builder lands in a
+/// later PR, it will surface dangling-edge errors as typed errors at
+/// build time rather than at iteration time.
 #[derive(Debug, Clone, Copy)]
 pub struct SliceSource<'a> {
     nodes: &'a [Node],
@@ -66,18 +116,21 @@ pub struct SliceSource<'a> {
 
 impl<'a> SliceSource<'a> {
     /// Wrap a pair of slices.
+    ///
+    /// The slices are not validated against each other; see the struct
+    /// doc for why and where the validation lands instead.
     #[must_use]
     pub const fn new(nodes: &'a [Node], edges: &'a [Edge]) -> Self {
         Self { nodes, edges }
     }
 
-    /// Number of nodes in the underlying slice.
+    /// Number of nodes in the underlying slice (no iteration, no allocation).
     #[must_use]
     pub const fn node_len(&self) -> usize {
         self.nodes.len()
     }
 
-    /// Number of edges in the underlying slice.
+    /// Number of edges in the underlying slice (no iteration, no allocation).
     #[must_use]
     pub const fn edge_len(&self) -> usize {
         self.edges.len()
@@ -86,6 +139,9 @@ impl<'a> SliceSource<'a> {
 
 impl GraphSource for SliceSource<'_> {
     fn nodes(&self) -> impl Iterator<Item = Node> + '_ {
+        // Cloning is cheap — Node is just a Uuid7 (16 bytes by value) plus
+        // a NodeKind (a String). For graphs that fit in memory, this is
+        // dominated by Leiden's downstream cost.
         self.nodes.iter().cloned()
     }
 
@@ -94,6 +150,8 @@ impl GraphSource for SliceSource<'_> {
     }
 
     fn node_count_hint(&self) -> Option<usize> {
+        // For a slice we always know the exact count, so the hint is
+        // tight rather than approximate.
         Some(self.nodes.len())
     }
 
@@ -107,6 +165,8 @@ mod tests {
     use super::{GraphSource, SliceSource};
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
 
+    /// Tiny fixture: a parcel owned by an owner — enough structure to
+    /// exercise iteration without being a real graph.
     fn make_demo() -> (Vec<Node>, Vec<Edge>) {
         let parcel = Node::fresh(NodeKind::new("parcel"));
         let owner = Node::fresh(NodeKind::new("owner"));
@@ -117,6 +177,8 @@ mod tests {
 
     #[test]
     fn empty_source_yields_nothing() {
+        // Empty slices must iterate to empty and report Some(0) — not
+        // None, since we genuinely know the count is zero.
         let src = SliceSource::new(&[], &[]);
         assert_eq!(src.nodes().count(), 0);
         assert_eq!(src.edges().count(), 0);
@@ -126,6 +188,8 @@ mod tests {
 
     #[test]
     fn yields_exactly_the_input() {
+        // Round-trip through the trait: the items the iterator produces
+        // must equal the items the slice contains, no transformation.
         let (nodes, edges) = make_demo();
         let src = SliceSource::new(&nodes, &edges);
 
@@ -137,6 +201,9 @@ mod tests {
 
     #[test]
     fn iteration_is_repeatable() {
+        // Contract clause (3) — calling nodes()/edges() twice must yield
+        // the same sequence both times. The builder relies on this when
+        // it iterates edges several times during a Leiden pass.
         let (nodes, edges) = make_demo();
         let src = SliceSource::new(&nodes, &edges);
 
@@ -154,6 +221,7 @@ mod tests {
 
     #[test]
     fn size_hints_match_slice_lengths() {
+        // For SliceSource specifically the hint is exact, not approximate.
         let (nodes, edges) = make_demo();
         let src = SliceSource::new(&nodes, &edges);
         assert_eq!(src.node_count_hint(), Some(2));
@@ -163,8 +231,9 @@ mod tests {
     }
 
     /// Confirms that `GraphSource` works as a generic bound, the way the
-    /// future `SwIndex::build_from_source(source: impl GraphSource)` will use
-    /// it. If this fn ever stops compiling, the trait shape has regressed.
+    /// future `SwIndex::build_from_source(source: impl GraphSource)` will
+    /// use it. If this fn ever stops compiling, the trait shape has
+    /// regressed in a way that would break every downstream consumer.
     fn count_via_trait<G: GraphSource>(g: &G) -> (usize, usize) {
         (g.nodes().count(), g.edges().count())
     }

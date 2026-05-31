@@ -36,6 +36,9 @@
 //! * [`hub_graph`] — [`hub_graph::HubGraph`], the Layer-2 adjacency
 //!   structure derived from a `Graph` plus a `HubSet`. Built by BFS
 //!   up to a `k_hop` ball; edge weights = `1 / hop_distance`.
+//! * [`region`] — [`region::RegionGraph`], the Layer-3 cluster→region
+//!   mapping derived by running Leiden on the cluster super-graph
+//!   (recursive Leiden, same trick Microsoft GraphRAG uses offline).
 
 pub mod community;
 pub mod gml;
@@ -44,15 +47,19 @@ pub mod hub;
 pub mod hub_graph;
 pub mod id;
 pub mod node;
+pub mod region;
 pub mod source;
 
-pub use community::{Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity};
+pub use community::{
+    Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity, regions_from_clusters,
+};
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
 pub use hub::HubSet;
 pub use hub_graph::HubGraph;
 pub use id::Uuid7;
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+pub use region::RegionGraph;
 pub use source::{GraphSource, SliceSource};
 
 /// Returns the crate version as declared in `Cargo.toml`.

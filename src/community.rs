@@ -655,12 +655,22 @@ pub fn leiden(graph: &Graph) -> Partition {
 /// ```
 #[must_use]
 pub fn leiden_seeded(graph: &Graph, seed: u64) -> Partition {
-    let n = graph.node_count();
+    leiden_on_weighted(WeightedGraph::from_graph(graph), seed)
+}
+
+/// Run multi-level Leiden directly on an internal [`WeightedGraph`].
+///
+/// Same algorithm as [`leiden_seeded`] but takes the weighted form
+/// already constructed. Used internally by [`regions_from_clusters`]
+/// so the region-detection pass doesn't have to round-trip through
+/// the public [`Graph`] type (which would require synthesizing
+/// `NodeId`s for super-clusters that have no public identity).
+fn leiden_on_weighted(mut wg: WeightedGraph, seed: u64) -> Partition {
+    let n = wg.node_count();
     if n == 0 {
         return Partition::new(Vec::new());
     }
 
-    let mut wg = WeightedGraph::from_graph(graph);
     if wg.twice_total_weight() == 0.0 {
         return Partition::new((0..n).collect());
     }
@@ -852,6 +862,63 @@ fn refine_partition(graph: &WeightedGraph, p: &Partition, seed: u64) -> Partitio
     }
 
     Partition::new(refined)
+}
+
+// =========================================================================
+// Region detection — Layer 3 of the four-layer index
+// =========================================================================
+
+/// Detect regions: groups of clusters that should be navigated to
+/// together at the top level of the query planner.
+///
+/// Algorithm (recursive Leiden):
+///
+/// 1. **Aggregate** the original graph using the cluster partition.
+///    Each cluster becomes a super-node; edge weights between
+///    super-nodes are summed from inter-cluster edges in the
+///    original graph.
+/// 2. **Run Leiden** on that super-graph. The partition Leiden
+///    produces *over the super-nodes* is the cluster→region map.
+///
+/// This is the same recursive-Leiden idea Microsoft GraphRAG uses
+/// offline for hierarchical summarization (arxiv:2404.16130);
+/// swindex applies it online for query routing.
+///
+/// # Output shape
+///
+/// Returns a [`Partition`] of length `partition.community_count()`
+/// — one entry per *cluster*. `result.community_of(c)` gives the
+/// region id of cluster `c`. `result.community_count()` is the
+/// number of regions detected.
+///
+/// # Trivial cases
+///
+/// * Zero clusters → empty partition.
+/// * One cluster → one region (containing that cluster).
+/// * Clusters with no inter-cluster edges → one region per cluster
+///   (since the super-graph has no edges and Leiden falls back to
+///   the trivial partition).
+///
+/// # Determinism
+///
+/// Same `(graph, partition, seed)` always yields the same regions
+/// — Leiden's local-moving uses a seeded RNG.
+#[must_use]
+pub fn regions_from_clusters(graph: &Graph, partition: &Partition, seed: u64) -> Partition {
+    let k = partition.community_count();
+    if k == 0 {
+        return Partition::new(Vec::new());
+    }
+    if k == 1 {
+        // One cluster → one region. Skip the aggregation work.
+        return Partition::new(vec![0]);
+    }
+    // Aggregate the original graph using the cluster partition →
+    // cluster super-graph. The super-graph is itself a WeightedGraph
+    // with `k` nodes.
+    let super_wg = WeightedGraph::from_graph(graph).aggregate(partition);
+    // Run multi-level Leiden directly on the super-graph.
+    leiden_on_weighted(super_wg, seed)
 }
 
 /// Build a `Vec<usize>` containing `0..n` in a seeded-random order,

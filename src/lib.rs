@@ -12,10 +12,10 @@
 //! exhibit emergent small-world structure.
 //!
 //! See [`DESIGN.md`](https://github.com/k8nstantin/swindex/blob/main/DESIGN.md)
-//! in the repository root for the full design document. This is v0.0.4 —
-//! core types, the [`GraphSource`] boundary, and a GML loader for academic
-//! fixtures. Index algorithms (Leiden, hubs, persistence, query) land in
-//! subsequent releases.
+//! in the repository root for the full design document. This is v0.0.5 —
+//! core types, the [`GraphSource`] boundary, a GML loader, an in-memory
+//! [`Graph`], and Louvain community detection. Hub detection, persistence,
+//! and the query planner land in subsequent releases.
 //!
 //! # Module map
 //!
@@ -25,13 +25,23 @@
 //!   implementation for in-memory tests.
 //! * [`gml`] — [`gml::GmlSource`], a loader for academic GML files
 //!   (Zachary, SNAP datasets, NetworkX exports). Implements [`GraphSource`].
+//! * [`graph`] — [`Graph`], an in-memory undirected/weighted graph built
+//!   from any [`GraphSource`]. The substrate the clustering algorithms
+//!   actually walk.
+//! * [`community`] — [`community::Partition`], [`community::modularity`],
+//!   and Louvain (the first community-detection algorithm) — produces
+//!   modularity ≥ 0.3 on Zachary karate. Leiden refinement lands next.
 
+pub mod community;
 pub mod gml;
+pub mod graph;
 pub mod id;
 pub mod node;
 pub mod source;
 
+pub use community::{Partition, louvain, louvain_seeded, modularity};
 pub use gml::{GmlError, GmlSource};
+pub use graph::{Graph, GraphError};
 pub use id::Uuid7;
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use source::{GraphSource, SliceSource};

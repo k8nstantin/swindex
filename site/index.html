@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>swindex — the small-world index for property graphs</title>
+    <meta
+      name="description"
+      content="The hierarchical small-world index for property graphs. O(log N) multi-hop queries that scale to billions of nodes. Open-source Rust crate; your data stays in MySQL / Postgres / Iceberg / wherever."
+    />
+    <meta property="og:title" content="swindex — the small-world index for property graphs" />
+    <meta property="og:description" content="O(log N) multi-hop graph queries. Open-source Rust crate. Your data stays in MySQL / Iceberg / wherever — swindex is a sidecar." />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#1F062A" />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container header__inner">
+        <a class="wordmark" href="/">
+          <svg class="wordmark__glyph" viewBox="0 0 32 32" aria-hidden="true">
+            <circle cx="6"  cy="16" r="3" />
+            <circle cx="16" cy="6"  r="3" />
+            <circle cx="26" cy="16" r="3" />
+            <circle cx="16" cy="26" r="3" />
+            <circle cx="16" cy="16" r="4" class="hub" />
+            <line x1="6"  y1="16" x2="16" y2="16" />
+            <line x1="16" y1="6"  x2="16" y2="16" />
+            <line x1="26" y1="16" x2="16" y2="16" />
+            <line x1="16" y1="26" x2="16" y2="16" />
+          </svg>
+          <span class="wordmark__text">swindex</span>
+        </a>
+        <nav class="site-nav">
+          <a href="#concept">Concept</a>
+          <a href="#how">How it works</a>
+          <a href="#install">Install</a>
+          <a href="https://github.com/k8nstantin/swindex/blob/main/DESIGN.md">Documentation</a>
+          <a class="ghost" href="https://github.com/k8nstantin/swindex">GitHub →</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <!-- HERO -->
+      <section class="hero">
+        <div class="container hero__grid">
+          <div class="hero__content">
+            <p class="eyebrow">v0.0.3 · early access · BSL 1.1</p>
+            <h1 class="hero__title">
+              swindex is the
+              <span class="grad">small-world index</span>
+              for property graphs
+            </h1>
+            <p class="hero__subtitle">
+              Multi-hop graph queries that scale to billions of nodes — O(log N) hub-aware traversal in pure Rust. Sits beside your existing store; never replaces it.
+            </p>
+            <div class="button-group">
+              <a class="btn btn-primary" href="#install">
+                Install Now
+                <svg viewBox="0 0 24 24" class="btn__icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+              </a>
+              <a class="btn btn-secondary" href="https://github.com/k8nstantin/swindex/blob/main/DESIGN.md">
+                Read Documentation
+              </a>
+            </div>
+          </div>
+
+          <div class="hero__terminal">
+            <div class="install-options">
+              <div class="install-option">
+                <div class="install-option__head">
+                  <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                  <span>Cargo</span>
+                </div>
+                <div class="terminal">
+                  <div class="terminal__chrome">
+                    <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+                  </div>
+                  <div class="terminal__body">
+                    <code>cargo add swindex --git https://github.com/k8nstantin/swindex</code>
+                    <button class="copy-btn" data-copy="cargo add swindex --git https://github.com/k8nstantin/swindex" aria-label="Copy">
+                      <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="install-option">
+                <div class="install-option__head">
+                  <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12c0 3.6-1.4 7-3.5 8.5-2.1 1.5-5.1 1.5-7.5 0-2.1-1.3-3.5-3.4-4.5-5.5-1-2.1-1.7-4.5-1.5-7"/><path d="M2 12h20"/></svg>
+                  <span>Clone &amp; test</span>
+                </div>
+                <div class="terminal">
+                  <div class="terminal__chrome">
+                    <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+                  </div>
+                  <div class="terminal__body">
+                    <code>git clone git@github.com:k8nstantin/swindex.git
+cd swindex &amp;&amp; cargo test</code>
+                    <button class="copy-btn" data-copy="git clone git@github.com:k8nstantin/swindex.git && cd swindex && cargo test" aria-label="Copy">
+                      <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="install-option">
+                <div class="install-option__head">
+                  <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                  <span>Embed in your app</span>
+                </div>
+                <div class="terminal">
+                  <div class="terminal__chrome">
+                    <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+                  </div>
+                  <div class="terminal__body">
+                    <code>use swindex::{Node, Edge, SliceSource};
+let src = SliceSource::new(&amp;nodes, &amp;edges);</code>
+                    <button class="copy-btn" data-copy="use swindex::{Node, Edge, SliceSource};
+let src = SliceSource::new(&nodes, &edges);" aria-label="Copy">
+                      <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CONCEPT -->
+      <section id="concept" class="block">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">Concept</p>
+            <h2>Indexes know where to look.<br />Databases hold what's there.</h2>
+          </div>
+          <div class="two-col">
+            <div>
+              <p>
+                Vector indexes like HNSW transformed similarity search by exploiting
+                the small-world structure that emerges from billion-vector corpora.
+                Property graphs have the same emergent small-world structure —
+                clusters, hubs, long-range bridges — but no equivalent index has
+                shipped to production. So traversal-heavy workloads still scan
+                edge-by-edge and degrade as graphs grow.
+              </p>
+              <p>
+                swindex is that index. Built from Leiden community detection,
+                degree- and centrality-based hub selection, recursive aggregation,
+                and Ada-IVF-style incremental maintenance. Every individual
+                component is research-mature; the synthesis as a persistent,
+                online, query-routing layer is what hadn't shipped.
+              </p>
+            </div>
+            <div>
+              <p>
+                Your data lives in whatever store already holds it — MySQL, Postgres,
+                Iceberg, Parquet, an HTTP API. swindex stores only structural
+                metadata: which cluster each node belongs to, which nodes are hubs,
+                what the cluster graph looks like — and uses that metadata to
+                narrow your queries by orders of magnitude before your primary store
+                ever sees them.
+              </p>
+              <p>
+                On disk that's typically 2–5% the size of your underlying data.
+                Your row payloads stay where they live.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FEATURES (6 cards, parallel to villagesql's "Powerful Extensions") -->
+      <section id="features" class="block alt">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">What it does</p>
+            <h2>Six built-in capabilities.</h2>
+            <p style="color: var(--text-dim); max-width: 56ch;">
+              Each is research-mature in isolation. swindex's contribution is the synthesis as a persistent, online, query-routing index.
+            </p>
+          </div>
+          <div class="features-grid">
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="6" r="2"/><circle cx="20" cy="6" r="2"/><circle cx="4" cy="18" r="2"/><circle cx="20" cy="18" r="2"/><line x1="12" y1="9" x2="5" y2="7"/><line x1="12" y1="9" x2="19" y2="7"/><line x1="12" y1="15" x2="5" y2="17"/><line x1="12" y1="15" x2="19" y2="17"/></svg>
+              </div>
+              <h3>Leiden clustering</h3>
+              <p>Mathematically guaranteed well-connected communities (Traag 2019). Parallel implementation; runs at O(N log N) over billion-edge graphs.</p>
+            </div>
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="9" y1="9" x2="7" y2="7"/><line x1="15" y1="9" x2="17" y2="7"/><line x1="9" y1="15" x2="7" y2="17"/><line x1="15" y1="15" x2="17" y2="17"/></svg>
+              </div>
+              <h3>Hub detection</h3>
+              <p>Identifies the 0.1–1% of nodes that are structurally pivotal. Built on the December 2024 "H in HNSW Stands for Hubs" insight applied to property data.</p>
+            </div>
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+              </div>
+              <h3>Recursive aggregation</h3>
+              <p>Communities of communities of communities. Region graph routes queries before any per-node work happens, the same recursive pattern Microsoft GraphRAG uses offline.</p>
+            </div>
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              </div>
+              <h3>Ada-IVF maintenance</h3>
+              <p>Incremental, workload-aware re-clustering. ~5× higher sustained-write throughput than naive whole-index rebuilds. Only the clusters that drifted get re-Leidened.</p>
+            </div>
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+              </div>
+              <h3>Time-travel queries</h3>
+              <p>Bitemporal cluster-assignment history. <code>query_as_of(ts)</code> resolves the cluster structure that existed at any past moment for audit and lineage.</p>
+            </div>
+            <div class="feature">
+              <div class="feature__icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              </div>
+              <h3>Persistent storage</h3>
+              <p>Fjall LSM for the hot working set (sub-ms lookups); Parquet on object storage for the cold history. Survives restarts; replicates cleanly.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- HOW IT WORKS -->
+      <section id="how" class="block">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">How it works</p>
+            <h2>Four layers. One query.</h2>
+          </div>
+          <div class="layers">
+            <article class="layer">
+              <div class="layer__id">3</div>
+              <h3>Region graph</h3>
+              <p>
+                Top-level Leiden communities of clusters. A few thousand nodes
+                even at billion-fact scale. Routes a query to the right
+                neighborhood before any real work happens.
+              </p>
+            </article>
+            <article class="layer">
+              <div class="layer__id">2</div>
+              <h3>Hub graph <span class="muted">— the highway</span></h3>
+              <p>
+                ~0.1–1 % of nodes, selected by degree, betweenness centrality,
+                type, and institutional role. Queries traverse hubs first;
+                genuinely small-world, so this is the O(log N) step.
+              </p>
+            </article>
+            <article class="layer">
+              <div class="layer__id">1</div>
+              <h3>Cluster graph</h3>
+              <p>
+                Leiden-detected, mathematically guaranteed well-connected
+                communities of 100–10,000 nodes. Bounds the search space once
+                hub navigation lands here.
+              </p>
+            </article>
+            <article class="layer">
+              <div class="layer__id">0</div>
+              <h3>Full fact graph</h3>
+              <p>
+                Ground truth. Persisted via Fjall (hot) plus Parquet (cold) for
+                time-travel. Only touched inside the bounded set the upper
+                layers have already narrowed to.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ARCHITECTURE -->
+      <section class="block">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">Architecture</p>
+            <h2>swindex is a sidecar, not a store.</h2>
+          </div>
+          <div class="diagram">
+<pre>           application query
+                  │
+                  ▼
+   ┌──────────────────────────┐
+   │   swindex (Rust crate)   │
+   │   ─────────────────────  │
+   │   • cluster of node X?   │   ← O(log N) hub-aware traversal
+   │   • members of cluster?  │
+   │   • multi-hop pattern?   │
+   │                          │   returns a small list of UUIDv7 ids
+   └────────────┬─────────────┘
+                │
+   ┌────────────▼─────────────┐
+   │  YOUR store (Iceberg /   │   ← columnar scan filtered by uuid7
+   │  MySQL / Postgres / ...) │     returns the actual row payloads
+   └──────────────────────────┘</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- CODE EXAMPLE -->
+      <section id="example" class="block alt">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">In code</p>
+            <h2>A minimal example.</h2>
+          </div>
+          <div class="code-shell">
+            <div class="code-shell__chrome">
+              <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+              <span class="code-shell__file">src/main.rs</span>
+            </div>
+            <pre><code><span class="tok-c">// Build a tiny property graph; show what swindex exposes today.</span>
+<span class="tok-c">// (Index algorithms + query layers land in subsequent releases.)</span>
+
+<span class="tok-k">use</span> swindex::{Edge, EdgeKind, Node, NodeKind, SliceSource};
+
+<span class="tok-k">fn</span> <span class="tok-fn">main</span>() {
+    <span class="tok-k">let</span> parcel = Node::<span class="tok-fn">fresh</span>(NodeKind::<span class="tok-fn">new</span>(<span class="tok-s">"parcel"</span>));
+    <span class="tok-k">let</span> owner  = Node::<span class="tok-fn">fresh</span>(NodeKind::<span class="tok-fn">new</span>(<span class="tok-s">"owner"</span>));
+    <span class="tok-k">let</span> owns   = Edge::<span class="tok-fn">fresh</span>(owner.id, parcel.id, EdgeKind::<span class="tok-fn">new</span>(<span class="tok-s">"owns"</span>));
+
+    <span class="tok-k">let</span> nodes = [parcel, owner];
+    <span class="tok-k">let</span> edges = [owns];
+    <span class="tok-k">let</span> _src = SliceSource::<span class="tok-fn">new</span>(&amp;nodes, &amp;edges);
+
+    <span class="tok-fn">println!</span>(<span class="tok-s">"swindex {}"</span>, swindex::<span class="tok-fn">version</span>());
+}</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- CREDIBILITY / RESEARCH -->
+      <section class="block alt">
+        <div class="container">
+          <div class="block__head" style="text-align: center; margin-left: auto; margin-right: auto;">
+            <p class="kicker">Built on published research</p>
+            <h2>Standing on the shoulders of giants.</h2>
+            <p style="color: var(--text-dim); max-width: 60ch; margin: 0 auto;">
+              Every individual component is research-mature. The novelty is the synthesis — combining these threads into a persistent, online, query-routing index that any application can embed.
+            </p>
+          </div>
+          <div class="research">
+            <a class="paper" href="https://arxiv.org/pdf/2412.01940">
+              <div class="paper__venue">arXiv · Dec 2024</div>
+              <div class="paper__title">Down with the Hierarchy: The "H" in HNSW Stands for Hubs</div>
+              <div class="paper__authors">Reframes HNSW as hub-driven, not hierarchy-driven.</div>
+            </a>
+            <a class="paper" href="https://www.nature.com/articles/s41598-019-41695-z">
+              <div class="paper__venue">Nature Sci Rep · 2019</div>
+              <div class="paper__title">From Louvain to Leiden: guaranteeing well-connected communities</div>
+              <div class="paper__authors">Traag, Waltman, van Eck.</div>
+            </a>
+            <a class="paper" href="https://arxiv.org/html/2411.00970v1">
+              <div class="paper__venue">arXiv · Nov 2024</div>
+              <div class="paper__title">Ada-IVF: Incremental IVF Index Maintenance for Streaming Vector Search</div>
+              <div class="paper__authors">Adaptive maintenance pattern adapted for property graphs.</div>
+            </a>
+            <a class="paper" href="https://arxiv.org/html/2404.16130v2">
+              <div class="paper__venue">Microsoft · 2024</div>
+              <div class="paper__title">GraphRAG — From Local to Global</div>
+              <div class="paper__authors">Recursive Leiden at scale; validates the approach offline.</div>
+            </a>
+            <a class="paper" href="https://dl.acm.org/doi/fullHtml/10.1145/3673038.3673146">
+              <div class="paper__venue">ACM · 2024</div>
+              <div class="paper__title">Fast Leiden Algorithm for Community Detection in Shared Memory</div>
+              <div class="paper__authors">Parallel Leiden — O(N log N) on billion-edge graphs.</div>
+            </a>
+            <a class="paper" href="https://arxiv.org/abs/1603.09320">
+              <div class="paper__venue">arXiv · 2016</div>
+              <div class="paper__title">Hierarchical Navigable Small World</div>
+              <div class="paper__authors">Malkov &amp; Yashunin — the algorithm this design generalizes from.</div>
+            </a>
+          </div>
+        </div>
+      </section>
+
+      <!-- LICENSE -->
+      <section class="block">
+        <div class="container">
+          <div class="block__head">
+            <p class="kicker">License</p>
+            <h2>Business Source License 1.1.</h2>
+          </div>
+          <div class="two-col">
+            <div>
+              <p>
+                Free to embed in any product whose primary value is something
+                other than swindex itself — applications, APIs, agents,
+                pipelines, knowledge graphs. No friction. No royalty.
+              </p>
+              <p>
+                Hosted-index-as-a-service offerings require a commercial
+                license. Standard BSL playbook.
+              </p>
+            </div>
+            <div>
+              <p>
+                Every release auto-converts to Apache 2.0 four years after it
+                ships. Today's code becomes fully permissive over time; recent
+                releases stay BSL until they age out.
+              </p>
+              <p>
+                Full text:
+                <a href="https://github.com/k8nstantin/swindex/blob/main/LICENSE">LICENSE</a>.
+                Commercial inquiries:
+                <a href="mailto:hello@swindex.ai">hello@swindex.ai</a>.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CTA -->
+      <section class="block cta">
+        <div class="container">
+          <h2>Ready to get started?</h2>
+          <p style="color: var(--text-dim); max-width: 56ch; margin: 0 auto var(--space-lg);">
+            Install swindex and start building. Read the design doc. Join the community.
+          </p>
+          <div class="button-group">
+            <a class="btn btn-primary" href="#install">
+              Install Now
+              <svg viewBox="0 0 24 24" class="btn__icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            </a>
+            <a class="btn btn-secondary" href="https://github.com/k8nstantin/swindex/blob/main/DESIGN.md">
+              Read Documentation
+            </a>
+            <a class="btn btn-discord" href="https://discord.gg/swindex">
+              <svg viewBox="0 0 24 24" class="btn__icon" fill="currentColor"><path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+              Join Community
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer__inner">
+        <div class="footer__cols">
+          <div>
+            <div class="wordmark">
+              <svg class="wordmark__glyph" viewBox="0 0 32 32" aria-hidden="true">
+                <circle cx="6"  cy="16" r="3" />
+                <circle cx="16" cy="6"  r="3" />
+                <circle cx="26" cy="16" r="3" />
+                <circle cx="16" cy="26" r="3" />
+                <circle cx="16" cy="16" r="4" class="hub" />
+                <line x1="6"  y1="16" x2="16" y2="16" />
+                <line x1="16" y1="6"  x2="16" y2="16" />
+                <line x1="26" y1="16" x2="16" y2="16" />
+                <line x1="16" y1="26" x2="16" y2="16" />
+              </svg>
+              <span class="wordmark__text">swindex</span>
+            </div>
+            <p class="footer__tag">Hierarchical small-world index for property graphs.</p>
+          </div>
+          <div>
+            <p class="footer__head">Project</p>
+            <a href="https://github.com/k8nstantin/swindex">GitHub</a>
+            <a href="https://github.com/k8nstantin/swindex/blob/main/DESIGN.md">Documentation</a>
+            <a href="https://github.com/k8nstantin/swindex/blob/main/deployment_plan.md">Roadmap</a>
+            <a href="https://github.com/k8nstantin/swindex/blob/main/LICENSE">License</a>
+          </div>
+          <div>
+            <p class="footer__head">Community</p>
+            <a href="https://discord.gg/swindex">Discord</a>
+            <a href="https://github.com/k8nstantin/swindex/discussions">Discussions</a>
+            <a href="https://github.com/k8nstantin/swindex/issues">Issues</a>
+          </div>
+          <div>
+            <p class="footer__head">Company</p>
+            <a href="mailto:hello@swindex.ai">hello@swindex.ai</a>
+            <a href="mailto:hello@swindex.ai">Commercial license</a>
+          </div>
+        </div>
+        <p class="footer__legal">© 2026 Constantin Alexander. BSL 1.1.</p>
+      </div>
+    </footer>
+
+    <script>
+      // Copy-to-clipboard for install buttons
+      document.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const text = btn.getAttribute('data-copy') || '';
+          navigator.clipboard.writeText(text);
+          btn.classList.add('copy-btn--copied');
+          setTimeout(() => btn.classList.remove('copy-btn--copied'), 1100);
+        });
+      });
+    </script>
+  </body>
+</html>

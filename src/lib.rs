@@ -32,12 +32,16 @@
 //!   Louvain and Leiden community detection. Produces Q ≈ 0.42 on
 //!   Zachary karate with provably-connected communities.
 //! * [`hub`] — [`hub::HubSet`], degree-based hub identification. The
-//!   Layer-2 structure swindex routes queries through.
+//!   Layer-2 hub set that the query planner routes through.
+//! * [`hub_graph`] — [`hub_graph::HubGraph`], the Layer-2 adjacency
+//!   structure derived from a `Graph` plus a `HubSet`. Built by BFS
+//!   up to a `k_hop` ball; edge weights = `1 / hop_distance`.
 
 pub mod community;
 pub mod gml;
 pub mod graph;
 pub mod hub;
+pub mod hub_graph;
 pub mod id;
 pub mod node;
 pub mod source;
@@ -46,6 +50,7 @@ pub use community::{Partition, leiden, leiden_seeded, louvain, louvain_seeded, m
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
 pub use hub::HubSet;
+pub use hub_graph::HubGraph;
 pub use id::Uuid7;
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use source::{GraphSource, SliceSource};

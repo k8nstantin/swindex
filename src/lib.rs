@@ -52,6 +52,7 @@ pub mod hub;
 pub mod hub_graph;
 pub mod id;
 pub mod index;
+pub mod maintenance;
 pub mod node;
 pub mod quality;
 pub mod region;
@@ -66,6 +67,10 @@ pub use hub::HubSet;
 pub use hub_graph::HubGraph;
 pub use id::Uuid7;
 pub use index::{BuildStats, QueryKind, QueryResult, QueryStats, SwIndex, SwIndexError, SwStats};
+pub use maintenance::{
+    ClusterDrift, DriftReport, MaintenanceAction, MaintenancePolicy, MaintenanceReport,
+    NeverRebalance,
+};
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use quality::nmi;
 pub use region::RegionGraph;

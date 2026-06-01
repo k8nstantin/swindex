@@ -11,10 +11,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `docs/HISTORY.md` preserving the original bootstrap plan as a historical artifact (was at `deployment_plan.md` in the repo root).
 - `BENCHMARKS.md` updated with the actual measured numbers from the v0.1.0 bench run and the correct SBM-parameter calibration.
 - GitHub repo description and homepage URL.
+- **`tracing` instrumentation on `SwIndex`** (review #44 §7.7). `open`, `build_from_source`, and `query` now emit `info`-level spans; `build_from_source` emits a debug-level sub-span per pipeline phase (`graph`, `leiden`, `regions`, `hubs`, `hub_graph`, `persist`) with structured fields (graph size, cluster count, hub count, query stats). No subscriber wired up; caller's choice. See the module-level doc for a quickstart with `tracing-subscriber`.
 
 ### Changed
 - `deployment_plan.md` (repo root) → `docs/HISTORY.md` — the bootstrap is done; the file was stale and contradicted what was actually built.
 - `BENCHMARKS.md` methodology section corrected: documents the **sparse** SBM (`p_in = target_avg_degree / (cluster_size − 1)`) actually used by `benches/scaling.rs`, not the unused dense parameters.
+
+### Dependencies
+- Added `tracing = "0.1"` (production dep).
+- Added `tracing-subscriber = "0.3"` with `env-filter` feature (dev-dep only, for the module-level doctest and any future span-emission tests).
 
 ---
 

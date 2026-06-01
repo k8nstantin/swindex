@@ -43,6 +43,27 @@
 //!   issue #27, post-v0.1.
 //! * **Time-travel** (`query_as_of`). Bitemporal history tables in
 //!   Parquet are issue #29, also post-v0.1.
+//!
+//! # Observability
+//!
+//! All public methods emit [`tracing`](https://docs.rs/tracing) spans
+//! at `info` level (`open`, `build_from_source`, `query`) with
+//! debug-level sub-spans per build pipeline phase
+//! (`graph`, `leiden`, `regions`, `hubs`, `hub_graph`, `persist`).
+//! Spans carry useful fields — graph size, cluster count, query stats —
+//! so a `tracing-subscriber` consumer can correlate the planner's
+//! routing decisions with wall-clock cost.
+//!
+//! No subscriber is wired up by default; the caller picks one. To see
+//! the spans during development:
+//!
+//! ```no_run
+//! use tracing_subscriber::EnvFilter;
+//! tracing_subscriber::fmt()
+//!     .with_env_filter(EnvFilter::from_default_env())
+//!     .init();
+//! // RUST_LOG=swindex=debug cargo run …
+//! ```
 
 use crate::community::leiden;
 use crate::graph::{Graph, GraphError};
@@ -55,6 +76,7 @@ use crate::source::GraphSource;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use std::fmt;
 use std::path::Path;
+use tracing::{debug, debug_span, info, info_span};
 use uuid::Uuid;
 
 // Default fraction of nodes flagged as hubs by `build_from_source`.
@@ -241,7 +263,9 @@ impl SwIndex {
     /// * [`SwIndexError::Fjall`] if Fjall can't open the keyspace or
     ///   recover the partitions (filesystem permission, corruption).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SwIndexError> {
-        let keyspace = Config::new(path).open()?;
+        let path_ref = path.as_ref();
+        let _span = info_span!("swindex.open", path = ?path_ref).entered();
+        let keyspace = Config::new(path_ref).open()?;
         let opts = PartitionCreateOptions::default();
         // Every partition is opened by name; if it doesn't exist yet
         // Fjall creates it transparently. Calling `open` twice on the
@@ -252,6 +276,7 @@ impl SwIndex {
         let hub_neighbors = keyspace.open_partition("hub_neighbors", opts.clone())?;
         let cluster_members = keyspace.open_partition("cluster_members", opts.clone())?;
         let cluster_meta = keyspace.open_partition("cluster_meta", opts)?;
+        debug!("keyspace + 6 partitions opened");
         Ok(Self {
             keyspace,
             uuid_to_cluster,
@@ -281,24 +306,55 @@ impl SwIndex {
     /// * [`SwIndexError::Corruption`] — a cluster or region id exceeded
     ///   the u32 storage limit (would only happen with > 4 B
     ///   communities; not realistically reachable).
+    // Long but linear: 5 pipeline phases inline so the tracing spans
+    // line up cleanly with the code structure. Splitting into helper
+    // methods would obscure that mapping.
+    #[allow(clippy::too_many_lines)]
     pub fn build_from_source<G: GraphSource>(
         &mut self,
         source: &G,
     ) -> Result<BuildStats, SwIndexError> {
+        let _span = info_span!("swindex.build").entered();
+
         // Step 1: in-memory Graph (Layer 0).
-        let graph = Graph::from_source(source)?;
+        let graph = {
+            let _phase = debug_span!("swindex.build.graph").entered();
+            Graph::from_source(source)?
+        };
+        debug!(nodes = graph.node_count(), "layer 0 — graph built");
 
         // Step 2: Leiden clusters (Layer 1).
-        let clusters = leiden(&graph);
+        let clusters = {
+            let _phase = debug_span!("swindex.build.leiden").entered();
+            leiden(&graph)
+        };
+        debug!(
+            communities = clusters.community_count(),
+            "layer 1 — leiden done"
+        );
 
         // Step 3: regions (Layer 3 — recursive Leiden over clusters).
-        let regions = RegionGraph::build(&graph, &clusters);
+        let regions = {
+            let _phase = debug_span!("swindex.build.regions").entered();
+            RegionGraph::build(&graph, &clusters)
+        };
+        debug!(regions = regions.region_count(), "layer 3 — regions done");
 
         // Step 4: hub set (Layer 2a) + hub graph (Layer 2b).
-        let hubs = HubSet::from_top_fraction(&graph, DEFAULT_HUB_FRACTION);
-        let hub_graph = HubGraph::build(&graph, &hubs, DEFAULT_HUB_GRAPH_K_HOP);
+        let hubs = {
+            let _phase = debug_span!("swindex.build.hubs").entered();
+            HubSet::from_top_fraction(&graph, DEFAULT_HUB_FRACTION)
+        };
+        debug!(hubs = hubs.len(), "layer 2a — hub set");
+
+        let hub_graph = {
+            let _phase = debug_span!("swindex.build.hub_graph").entered();
+            HubGraph::build(&graph, &hubs, DEFAULT_HUB_GRAPH_K_HOP)
+        };
+        debug!(edges = hub_graph.edge_count(), "layer 2b — hub graph");
 
         // Step 5: persist everything via one atomic Fjall batch.
+        let _persist = debug_span!("swindex.build.persist").entered();
         let mut batch = self.keyspace.batch();
 
         for u in 0..graph.node_count() {
@@ -377,13 +433,22 @@ impl SwIndex {
         // the same path will see exactly this build.
         batch.commit()?;
         self.keyspace.persist(PersistMode::SyncAll)?;
+        debug!("layer all — committed + fsynced");
 
-        Ok(BuildStats {
+        let stats = BuildStats {
             nodes: graph.node_count(),
             clusters: clusters.community_count(),
             regions: regions.region_count(),
             hubs: hubs.len(),
-        })
+        };
+        info!(
+            nodes = stats.nodes,
+            clusters = stats.clusters,
+            regions = stats.regions,
+            hubs = stats.hubs,
+            "build complete"
+        );
+        Ok(stats)
     }
 
     // ---- Read accessors ----
@@ -474,10 +539,18 @@ impl SwIndex {
     /// * [`SwIndexError::Corruption`] if stored data has the wrong
     ///   shape (cluster id stored as the wrong byte count, etc.).
     pub fn query(&self, query: QueryKind) -> Result<QueryResult, SwIndexError> {
-        match query {
+        let _span = info_span!("swindex.query", kind = ?query).entered();
+        let result = match query {
             QueryKind::SameCluster { start } => self.query_same_cluster(start),
             QueryKind::Similar { start, limit } => self.query_similar(start, limit),
-        }
+        }?;
+        info!(
+            uuids = result.uuids.len(),
+            clusters_visited = result.stats.clusters_visited,
+            hubs_visited = result.stats.hubs_visited,
+            "query complete"
+        );
+        Ok(result)
     }
 
     /// `QueryKind::SameCluster` — return every uuid in the same

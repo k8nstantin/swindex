@@ -155,6 +155,79 @@ pub struct BuildStats {
     pub hubs: usize,
 }
 
+/// What kind of query to run. Each variant maps to a specific routing
+/// path through the four-layer index.
+///
+/// More query kinds will be added as use cases land. For v0.1 the two
+/// here exercise the load-bearing routing primitives:
+///
+/// * [`QueryKind::SameCluster`] — a single-layer lookup. Resolves the
+///   start node's cluster (Layer-1 lookup via Fjall) and returns its
+///   members (Layer-1 fan-out). Demonstrates the cheapest possible
+///   query path; latency is dominated by the cluster-members fetch.
+/// * [`QueryKind::Similar`] — a two-layer query. Resolves the start's
+///   cluster, returns its members first (priority 0), then expands to
+///   neighboring clusters by walking the hub graph (Layer 2), then
+///   collecting those clusters' members (priority 1). Truncated at
+///   `limit`. Demonstrates Layer-0 → Layer-1 → Layer-2 → Layer-1
+///   routing — the typical "find me things related to X" query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// Return every uuid in the same cluster as `start`. The start
+    /// uuid itself is included.
+    SameCluster {
+        /// The seed node whose cluster will be returned.
+        start: Uuid7,
+    },
+    /// Return up to `limit` uuids structurally similar to `start`,
+    /// in priority order: same cluster first, then neighboring
+    /// clusters reached via the hub graph.
+    Similar {
+        /// The seed node.
+        start: Uuid7,
+        /// Maximum number of results to return.
+        limit: usize,
+    },
+}
+
+/// Per-query observability — useful for measuring whether the routing
+/// took the expected path and for benchmarking. Not stable API yet;
+/// fields may be added or renamed in future versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryStats {
+    /// Number of distinct clusters whose members were inspected.
+    pub clusters_visited: usize,
+    /// Number of hub-graph edges followed during routing.
+    pub hubs_visited: usize,
+}
+
+/// Result of a query against [`SwIndex`]. Contains the matched uuids
+/// (in priority order — same cluster first, then expanded clusters)
+/// and routing telemetry.
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    /// Matched uuids in priority order (same cluster first when the
+    /// query is `Similar`; for `SameCluster` the order is sorted by
+    /// `Uuid7` since `cluster_members` returns them that way).
+    pub uuids: Vec<Uuid7>,
+    /// Routing telemetry.
+    pub stats: QueryStats,
+}
+
+/// Counts of what's currently stored in the index — for introspection
+/// and benchmarking. Cheap to compute (uses Fjall's
+/// `approximate_len`); not authoritative under concurrent writes but
+/// fine for stats panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwStats {
+    /// Approximate number of nodes (entries in `uuid_to_cluster`).
+    pub nodes: usize,
+    /// Approximate number of clusters (entries in `cluster_members`).
+    pub clusters: usize,
+    /// Approximate number of hubs (entries in `hub_neighbors`).
+    pub hubs: usize,
+}
+
 impl SwIndex {
     /// Open (or create) a `SwIndex` at the given filesystem path.
     ///
@@ -375,6 +448,182 @@ impl SwIndex {
         }
     }
 
+    /// Cheap introspection counts — node / cluster / hub totals.
+    ///
+    /// Uses Fjall's `approximate_len` per partition; values are
+    /// accurate for a single-writer index built with one
+    /// `build_from_source` call. After incremental updates land
+    /// (issue #27) these become approximations.
+    #[must_use]
+    pub fn stats(&self) -> SwStats {
+        SwStats {
+            nodes: self.uuid_to_cluster.approximate_len(),
+            clusters: self.cluster_members.approximate_len(),
+            hubs: self.hub_neighbors.approximate_len(),
+        }
+    }
+
+    /// Run a structured query against the persisted index.
+    ///
+    /// See [`QueryKind`] for the available operations. Returns a
+    /// [`QueryResult`] with the matched uuids plus routing telemetry.
+    ///
+    /// # Errors
+    ///
+    /// * [`SwIndexError::Fjall`] for any underlying read failure.
+    /// * [`SwIndexError::Corruption`] if stored data has the wrong
+    ///   shape (cluster id stored as the wrong byte count, etc.).
+    pub fn query(&self, query: QueryKind) -> Result<QueryResult, SwIndexError> {
+        match query {
+            QueryKind::SameCluster { start } => self.query_same_cluster(start),
+            QueryKind::Similar { start, limit } => self.query_similar(start, limit),
+        }
+    }
+
+    /// `QueryKind::SameCluster` — return every uuid in the same
+    /// cluster as `start`. Pure Layer-1 lookup.
+    fn query_same_cluster(&self, start: Uuid7) -> Result<QueryResult, SwIndexError> {
+        // Step 1: which cluster is the seed in?
+        let Some(cluster_id) = self.cluster_of(start)? else {
+            // Unknown node — empty result, no clusters visited.
+            return Ok(QueryResult {
+                uuids: Vec::new(),
+                stats: QueryStats::default(),
+            });
+        };
+        // Step 2: fetch the cluster's members.
+        let members = self.cluster_members(cluster_id)?.unwrap_or_default();
+        Ok(QueryResult {
+            uuids: members,
+            stats: QueryStats {
+                clusters_visited: 1,
+                hubs_visited: 0,
+            },
+        })
+    }
+
+    /// `QueryKind::Similar` — same-cluster first, then expand to
+    /// neighboring clusters via the hub graph. The textbook 4-layer
+    /// routing for "find things related to X" queries.
+    fn query_similar(&self, start: Uuid7, limit: usize) -> Result<QueryResult, SwIndexError> {
+        if limit == 0 {
+            return Ok(QueryResult {
+                uuids: Vec::new(),
+                stats: QueryStats::default(),
+            });
+        }
+
+        // Step 1: resolve the start's cluster (Layer 1).
+        let Some(start_cluster) = self.cluster_of(start)? else {
+            return Ok(QueryResult {
+                uuids: Vec::new(),
+                stats: QueryStats::default(),
+            });
+        };
+
+        // Track in-order accumulation and a dedup set in parallel.
+        // The Vec preserves priority order; the BTreeSet prevents
+        // duplicate entries when neighboring clusters overlap.
+        let mut out: Vec<Uuid7> = Vec::with_capacity(limit);
+        let mut seen: std::collections::BTreeSet<Uuid7> = std::collections::BTreeSet::new();
+        seen.insert(start); // never include the seed itself in similar-results
+
+        let mut clusters_visited = 0_usize;
+        let mut hubs_visited = 0_usize;
+
+        // Step 2 (priority 0): the start's own cluster members.
+        let local = self.cluster_members(start_cluster)?.unwrap_or_default();
+        clusters_visited += 1;
+        for u in local {
+            if out.len() >= limit {
+                break;
+            }
+            if seen.insert(u) {
+                out.push(u);
+            }
+        }
+
+        if out.len() >= limit {
+            return Ok(QueryResult {
+                uuids: out,
+                stats: QueryStats {
+                    clusters_visited,
+                    hubs_visited,
+                },
+            });
+        }
+
+        // Step 3: find a hub in the start's cluster to anchor the
+        // hub-graph walk. Prefer the start itself if it's a hub;
+        // otherwise scan the cluster members for any hub.
+        let mut entry_hub: Option<Uuid7> = None;
+        if self.is_hub(start)? {
+            entry_hub = Some(start);
+        } else {
+            // Reload cluster members because the borrow above moved them.
+            // (Cheap — same Fjall read, in OS cache.)
+            for m in self.cluster_members(start_cluster)?.unwrap_or_default() {
+                if self.is_hub(m)? {
+                    entry_hub = Some(m);
+                    break;
+                }
+            }
+        }
+
+        // If the start's cluster has no hub at all, we can't expand
+        // further with what's persisted. Return what we have.
+        let Some(entry) = entry_hub else {
+            return Ok(QueryResult {
+                uuids: out,
+                stats: QueryStats {
+                    clusters_visited,
+                    hubs_visited,
+                },
+            });
+        };
+
+        // Step 4: walk the hub graph (Layer 2). Visit neighboring hubs
+        // in descending weight order so closer clusters fill the
+        // result first.
+        let mut hub_edges = self.hub_neighbors(entry)?;
+        hub_edges.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (neighbor_hub, _weight) in hub_edges {
+            hubs_visited += 1;
+
+            // Step 5: which cluster does this neighbor hub anchor?
+            let Some(neighbor_cluster) = self.cluster_of(neighbor_hub)? else {
+                continue;
+            };
+            if neighbor_cluster == start_cluster {
+                continue; // already drained above
+            }
+
+            // Step 6: collect that cluster's members.
+            let neighbor_members = self.cluster_members(neighbor_cluster)?.unwrap_or_default();
+            clusters_visited += 1;
+            for u in neighbor_members {
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(u) {
+                    out.push(u);
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(QueryResult {
+            uuids: out,
+            stats: QueryStats {
+                clusters_visited,
+                hubs_visited,
+            },
+        })
+    }
+
     /// The (size, hub_count) pair for a cluster, or `None` if unknown.
     ///
     /// # Errors
@@ -525,7 +774,7 @@ fn decode_u32(bytes: &[u8], context: &str) -> Result<u32, SwIndexError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildStats, SwIndex};
+    use super::{BuildStats, QueryKind, SwIndex};
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
     use crate::source::{GraphSource, SliceSource};
     use tempfile::TempDir;
@@ -735,5 +984,154 @@ mod tests {
             assert_eq!(size as usize, members.len());
             assert!(hubs <= size);
         }
+    }
+
+    // =====================================================================
+    // Query planner tests
+    // =====================================================================
+
+    #[test]
+    fn stats_match_build_counts() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let build_stats = idx.build_from_source(&src).unwrap();
+
+        let s = idx.stats();
+        assert_eq!(s.nodes, build_stats.nodes);
+        assert_eq!(s.clusters, build_stats.clusters);
+        assert_eq!(s.hubs, build_stats.hubs);
+    }
+
+    #[test]
+    fn same_cluster_returns_full_cluster() {
+        // On two disjoint triangles: SameCluster on a triangle-member
+        // returns exactly that triangle's 3 nodes.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let result = idx
+            .query(QueryKind::SameCluster { start: nodes[0].id })
+            .unwrap();
+        assert_eq!(result.uuids.len(), 3);
+        // The 3 must be exactly {nodes[0], nodes[1], nodes[2]} as a set.
+        let got: std::collections::BTreeSet<_> = result.uuids.iter().copied().collect();
+        let want: std::collections::BTreeSet<_> = [nodes[0].id, nodes[1].id, nodes[2].id]
+            .into_iter()
+            .collect();
+        assert_eq!(got, want);
+        // One cluster visited, no hub-graph traversal needed.
+        assert_eq!(result.stats.clusters_visited, 1);
+        assert_eq!(result.stats.hubs_visited, 0);
+    }
+
+    #[test]
+    fn same_cluster_on_unknown_uuid_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let unknown = crate::id::Uuid7::now();
+        let result = idx
+            .query(QueryKind::SameCluster { start: unknown })
+            .unwrap();
+        assert!(result.uuids.is_empty());
+        assert_eq!(result.stats.clusters_visited, 0);
+    }
+
+    #[test]
+    fn similar_with_limit_zero_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let result = idx
+            .query(QueryKind::Similar {
+                start: nodes[0].id,
+                limit: 0,
+            })
+            .unwrap();
+        assert!(result.uuids.is_empty());
+    }
+
+    #[test]
+    fn similar_respects_limit() {
+        // Two disjoint triangles, no inter-cluster edges, so the hub
+        // graph has no edges across them. Similar must return only
+        // same-cluster members (at most 2 others), bounded by limit.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let result = idx
+            .query(QueryKind::Similar {
+                start: nodes[0].id,
+                limit: 1,
+            })
+            .unwrap();
+        assert!(result.uuids.len() <= 1);
+        // The seed itself must not be in the results.
+        assert!(!result.uuids.contains(&nodes[0].id));
+    }
+
+    /// Headline test: on Zachary, `Similar(Mr Hi, 33)` must return up
+    /// to 33 other nodes — all of them, since limit ≥ 33. The first
+    /// chunk is Mr Hi's cluster; the rest come via the hub graph from
+    /// other clusters' members.
+    #[test]
+    fn similar_on_zachary_fans_out_via_hub_graph() {
+        let dir = TempDir::new().unwrap();
+        let src = crate::gml::GmlSource::from_path(
+            "tests/fixtures/karate.gml",
+            &NodeKind::new("m"),
+            &EdgeKind::new("f"),
+        )
+        .unwrap();
+
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        idx.build_from_source(&src).unwrap();
+
+        // Mr Hi is the first node minted by the GML loader (gml id 1).
+        // We don't know his exact Uuid7 here but any node from src
+        // works for this test.
+        let some_node = src.nodes().next().unwrap();
+
+        // Request many more than one cluster's worth — forces the hub-
+        // graph expansion path to kick in.
+        let result = idx
+            .query(QueryKind::Similar {
+                start: some_node.id,
+                limit: 33,
+            })
+            .unwrap();
+
+        // Should pull in nodes from multiple clusters.
+        assert!(
+            result.stats.clusters_visited >= 2,
+            "expected hub-graph expansion to touch >= 2 clusters, got {}",
+            result.stats.clusters_visited
+        );
+        assert!(
+            result.stats.hubs_visited > 0,
+            "expected the hub-graph to be walked"
+        );
+
+        // Result should not include the seed.
+        assert!(!result.uuids.contains(&some_node.id));
+
+        // Result should not exceed limit and should be deduplicated.
+        assert!(result.uuids.len() <= 33);
+        let uniq: std::collections::BTreeSet<_> = result.uuids.iter().copied().collect();
+        assert_eq!(uniq.len(), result.uuids.len(), "result has duplicates");
     }
 }

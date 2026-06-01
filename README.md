@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The full design — Leiden community detection, hub-graph navigation, four-layer query routing, Ada-IVF-style incremental maintenance, persistent storage layout — is documented in [`DESIGN.md`](DESIGN.md). The bootstrap plan from scratch is in [`deployment_plan.md`](deployment_plan.md).
+The full design — Leiden community detection, hub-graph navigation, four-layer query routing, Ada-IVF-style incremental maintenance, persistent storage layout — is documented in [`DESIGN.md`](DESIGN.md). Bench methodology and current numbers in [`BENCHMARKS.md`](BENCHMARKS.md). Release history in [`CHANGELOG.md`](CHANGELOG.md). Contribution guide in [`CONTRIBUTING.md`](CONTRIBUTING.md). The original bootstrap plan (archival) is at [`docs/HISTORY.md`](docs/HISTORY.md).
 
 ## What's shipped in v0.1.0
 

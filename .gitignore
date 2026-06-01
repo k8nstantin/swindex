@@ -7,3 +7,10 @@ Cargo.lock
 *.log
 data/
 .env
+
+# External review artifacts dropped in the working tree by reviewers.
+# Move into docs/REVIEWS/ before committing if you want to keep one.
+gemini_revew.md
+gemini_review.md
+*_review_draft.md
+review_*.md

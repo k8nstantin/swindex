@@ -159,9 +159,11 @@ fn cmd_build(
     println!("Reading SQL dump: {}", from_sql.display());
     let source = SqlDumpSource::from_path(from_sql)?;
     println!(
-        "Parsed: {} tables, {} foreign keys",
+        "Parsed: {} tables, {} FKs, {} procedure-co-occurrence pairs ({} total edges)",
         source.table_count(),
-        source.fk_count()
+        source.fk_count(),
+        source.proc_pair_count(),
+        source.edge_count(),
     );
 
     // Vec-ify so we can hand the same data to a SliceSource (the

@@ -111,6 +111,14 @@ pub struct SqlDumpSource {
     /// the `customer` table?" for queries. Sorted by name (BTreeMap)
     /// for deterministic iteration.
     name_to_uuid: BTreeMap<String, Uuid7>,
+    /// How many of the edges came from declared `FOREIGN KEY` clauses.
+    /// The rest are procedure-co-occurrence edges. Sum equals
+    /// `edges.len()`.
+    fk_edges: usize,
+    /// Distinct co-occurrence pairs (irrespective of multiplicity)
+    /// discovered in stored-procedure bodies. Reporting metric only —
+    /// each pair may have produced multiple `Edge` entries in `edges`.
+    proc_pairs_emitted: usize,
 }
 
 impl SqlDumpSource {
@@ -152,29 +160,58 @@ impl SqlDumpSource {
             nodes.push(node);
         }
 
-        let mut edges = Vec::with_capacity(p.foreign_keys.len());
-        let mut dropped = 0_usize;
+        let mut edges = Vec::with_capacity(p.foreign_keys.len() + p.procedure_pairs.len());
+        let mut dropped_fks = 0_usize;
         for (src, dst) in &p.foreign_keys {
             let (Some(&src_id), Some(&dst_id)) = (name_to_uuid.get(src), name_to_uuid.get(dst))
             else {
-                dropped += 1;
+                dropped_fks += 1;
                 warn!(src = %src, dst = %dst, "FK references unknown table — skipping");
                 continue;
             };
             edges.push(Edge::fresh(src_id, dst_id, EdgeKind::new("fk")));
         }
 
+        // Procedure co-occurrence edges. For a pair (A, B) co-mentioned
+        // in N routines, emit N separate Edge instances — Graph today
+        // treats every edge as unit-weight, so N unit edges compound
+        // into a weight-N effective edge (degrees, twice_m, modularity
+        // all sum correctly). When a future PR lets `Edge` carry a
+        // weight directly we'll collapse these into single edges.
+        let mut proc_pairs_resolved = 0_usize;
+        let mut proc_pairs_dropped = 0_usize;
+        let mut proc_edges_emitted = 0_usize;
+        for ((src, dst), count) in &p.procedure_pairs {
+            let (Some(&src_id), Some(&dst_id)) = (name_to_uuid.get(src), name_to_uuid.get(dst))
+            else {
+                proc_pairs_dropped += 1;
+                continue;
+            };
+            proc_pairs_resolved += 1;
+            for _ in 0..*count {
+                edges.push(Edge::fresh(src_id, dst_id, EdgeKind::new("proc_cooccur")));
+                proc_edges_emitted += 1;
+            }
+        }
+
         info!(
             tables = nodes.len(),
-            fks = edges.len(),
-            dropped_fks = dropped,
+            fks = p.foreign_keys.len() - dropped_fks,
+            dropped_fks = dropped_fks,
+            proc_pairs_resolved = proc_pairs_resolved,
+            proc_pairs_dropped = proc_pairs_dropped,
+            proc_edges_emitted = proc_edges_emitted,
+            total_edges = edges.len(),
             "sql dump parsed"
         );
 
+        let fk_edges = p.foreign_keys.len() - dropped_fks;
         Ok(Self {
             nodes,
             edges,
             name_to_uuid,
+            fk_edges,
+            proc_pairs_emitted: proc_pairs_resolved,
         })
     }
 
@@ -185,9 +222,28 @@ impl SqlDumpSource {
     }
 
     /// Number of foreign-key edges ingested (after dropping dangling
-    /// references).
+    /// references). Excludes procedure-co-occurrence edges; see
+    /// [`Self::proc_pair_count`] and [`Self::edge_count`] for those.
     #[must_use]
     pub fn fk_count(&self) -> usize {
+        self.fk_edges
+    }
+
+    /// Number of distinct procedure-co-occurrence pairs ingested. Each
+    /// pair may have produced multiple `Edge` entries in the underlying
+    /// edge list (one per routine that mentioned both tables), but the
+    /// distinct *pair* count is what humans want for "how many table
+    /// relationships did we infer from procedures?"
+    #[must_use]
+    pub fn proc_pair_count(&self) -> usize {
+        self.proc_pairs_emitted
+    }
+
+    /// Total number of `Edge` instances yielded by this source —
+    /// `fk_count + proc_pair_count_with_multiplicity`. Use when you
+    /// want the raw count Leiden will see.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
 
@@ -250,6 +306,15 @@ struct Parser<'a> {
     /// source ordering here for diagnostic warning messages on
     /// dangling FKs.
     foreign_keys: Vec<(String, String)>,
+    /// Per-routine: tables mentioned in the current routine body.
+    /// Reset on every DELIMITER block boundary. A `BTreeSet` so the
+    /// pair-emission at routine end is deterministic.
+    current_routine_mentions: std::collections::BTreeSet<String>,
+    /// Co-occurrence counts: `(table_a, table_b)` → # of routines that
+    /// mentioned both. Stored with `table_a < table_b` so each
+    /// unordered pair is counted exactly once. Resolved to edges in
+    /// `from_sql`.
+    procedure_pairs: std::collections::BTreeMap<(String, String), u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -258,7 +323,26 @@ impl<'a> Parser<'a> {
             src,
             tables: Vec::new(),
             foreign_keys: Vec::new(),
+            current_routine_mentions: std::collections::BTreeSet::new(),
+            procedure_pairs: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// At the end of a routine (DELIMITER ;): for every pair of
+    /// tables mentioned in the just-finished routine, increment the
+    /// co-occurrence count. Then clear the set for the next routine.
+    fn flush_routine_pairs(&mut self) {
+        let mentions: Vec<&String> = self.current_routine_mentions.iter().collect();
+        for i in 0..mentions.len() {
+            for j in (i + 1)..mentions.len() {
+                let a = mentions[i];
+                let b = mentions[j];
+                // Already in BTreeSet order, so a < b.
+                let key = (a.clone(), b.clone());
+                *self.procedure_pairs.entry(key).or_insert(0) += 1;
+            }
+        }
+        self.current_routine_mentions.clear();
     }
 
     /// Walk the input once, extracting tables and FKs. Today this
@@ -329,18 +413,25 @@ impl<'a> Parser<'a> {
             // against state desync from malformed dumps).
             if let Some(delim) = line.trim_start().strip_prefix("DELIMITER ") {
                 if delim.trim() == ";" {
+                    // End of routine block — emit co-occurrence pairs
+                    // from this routine's mentions before clearing.
+                    self.flush_routine_pairs();
                     mode = Mode::Outside;
                 } else {
+                    // Start of routine block — fresh mention set.
+                    self.current_routine_mentions.clear();
                     mode = Mode::InsideRoutine;
                 }
                 continue;
             }
 
-            // Step 0.5: in InsideRoutine mode, skip everything. We
-            // don't even look for table mentions here — that's the
-            // job of a future MysqlProcedureSource that wants
-            // co-occurrence edges, not table identity.
+            // Step 0.5: in InsideRoutine mode, extract table mentions
+            // from the line's SQL keywords (FROM / JOIN / INTO /
+            // UPDATE / DELETE FROM). Each mention is added to the
+            // routine's set; at routine end (DELIMITER ;), all
+            // pairs become co-occurrence increments.
             if matches!(mode, Mode::InsideRoutine) {
+                extract_table_mentions(line, &current_db, &mut self.current_routine_mentions);
                 continue;
             }
 
@@ -414,6 +505,149 @@ enum Mode {
     Outside,
     InsideTable(String),
     InsideRoutine,
+}
+
+/// Scan a single routine-body line for table mentions and add them
+/// (qualified with `current_db`) to `out`. Looks for any of these
+/// SQL keywords followed by an identifier:
+///
+/// * `FROM <table>`
+/// * `JOIN <table>` (works for `INNER JOIN`, `LEFT JOIN`, etc. since
+///   they all end in the bare word `JOIN`)
+/// * `INTO <table>` (covers `INSERT INTO` plus `SELECT … INTO`)
+/// * `UPDATE <table>`
+/// * `DELETE FROM <table>` (matched via `FROM` alone — `DELETE` is
+///   just a noise prefix)
+///
+/// Identifier scanning is intentionally conservative: it reads up
+/// through `[A-Za-z0-9_.]+` after the keyword, optionally stripping
+/// outer backticks. This catches the common cases — `tbl_x`,
+/// `db.tbl_x`, `` `tbl_x` `` — and skips constructs like `FROM
+/// (SELECT …)` (parenthesized subqueries) and `FROM @var` (procedure
+/// variables) silently. Better to under-collect (and miss some
+/// edges) than over-collect garbage tables.
+///
+/// We don't validate against the known table set here — that
+/// happens in `from_sql` when we resolve pairs to uuids. Mentions
+/// of unknown / temp tables get dropped at the resolution step.
+fn extract_table_mentions(
+    line: &str,
+    current_db: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    // Keywords we look for. Each must be followed by whitespace +
+    // an identifier. Case-insensitive match.
+    const KEYWORDS: &[&str] = &["FROM", "JOIN", "INTO", "UPDATE"];
+
+    let bytes = line.as_bytes();
+    for kw in KEYWORDS {
+        let kw_bytes = kw.as_bytes();
+        let n = kw_bytes.len();
+        if bytes.len() < n + 2 {
+            continue;
+        }
+        let mut i = 0;
+        while i + n < bytes.len() {
+            // Check case-insensitive match.
+            if bytes[i..i + n]
+                .iter()
+                .zip(kw_bytes)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                // Boundary check: previous char (if any) must be
+                // non-alphanumeric, and the char after must be
+                // whitespace.
+                let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                let next_is_ws = bytes.get(i + n).is_some_and(u8::is_ascii_whitespace);
+                if prev_ok && next_is_ws {
+                    // Skip the keyword and its whitespace; read the
+                    // identifier that follows.
+                    let mut j = i + n;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if let Some(ident) = read_table_ident(&line[j..]) {
+                        out.insert(qualify_table_name(current_db, &ident));
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Read a (possibly qualified, possibly backticked) table identifier
+/// from the start of `s`. Returns `Some(name)` if we got an
+/// identifier; `None` otherwise (parenthesized subquery, variable,
+/// etc.).
+///
+/// Stops at the first non-identifier character. Identifiers are
+/// `[A-Za-z_][A-Za-z0-9_]*`, optionally with `.` separating db and
+/// table.
+fn read_table_ident(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    // Handle backtick-quoted form: `name` or `db`.`name`.
+    if let Some(stripped) = s.strip_prefix('`') {
+        let end = stripped.find('`')?;
+        let first = &stripped[..end];
+        let after = &stripped[end + 1..];
+        if let Some(rest) = after.strip_prefix('.') {
+            let rest = rest.trim_start();
+            if let Some(inner) = rest.strip_prefix('`') {
+                let inner_end = inner.find('`')?;
+                return Some(format!("{first}.{}", &inner[..inner_end]));
+            }
+            // Unquoted second half.
+            if let Some(second) = read_bare_ident(rest) {
+                return Some(format!("{first}.{second}"));
+            }
+        }
+        return Some(first.to_string());
+    }
+    // Plain ident (with optional .qualifier).
+    read_bare_ident(s)
+}
+
+/// Read a bare (unquoted, possibly dotted) identifier from the start
+/// of `s`. Returns None if `s` doesn't start with an identifier
+/// character (`[A-Za-z_]`).
+fn read_bare_ident(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let c0 = bytes[0];
+    if !(c0.is_ascii_alphabetic() || c0 == b'_') {
+        return None;
+    }
+    let mut i = 1;
+    let mut saw_dot = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i += 1;
+        } else if c == b'.' && !saw_dot {
+            // Allow ONE dot for db.table qualified form.
+            // Check that next char is an identifier start, else stop.
+            if let Some(next) = bytes.get(i + 1) {
+                if next.is_ascii_alphabetic() || *next == b'_' {
+                    saw_dot = true;
+                    i += 1;
+                    continue;
+                }
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    Some(s[..i].to_string())
 }
 
 /// Qualify a raw table name with the current database context.
@@ -874,5 +1108,126 @@ CREATE TABLE `real_table_2` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=Inn
         assert!(names.contains(&"live.real_table"));
         assert!(names.contains(&"live.real_table_2"));
         assert!(!names.iter().any(|n| n.contains("temp_inside_routine")));
+    }
+
+    /// Procedure co-occurrence: two real tables co-mentioned in a
+    /// procedure body should produce one edge between them.
+    #[test]
+    fn procedure_body_cooccurrence_emits_edges() {
+        let sql = r"
+USE `app`;
+CREATE TABLE `a` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+CREATE TABLE `b` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+CREATE TABLE `c` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `join_a_b`()
+BEGIN
+  SELECT a.id, b.id FROM a INNER JOIN b ON a.id = b.id;
+END ;;
+DELIMITER ;
+";
+        let src = SqlDumpSource::from_sql(sql).unwrap();
+        assert_eq!(src.table_count(), 3);
+        assert_eq!(src.fk_count(), 0);
+        // a-b co-mentioned in one procedure → one pair, one edge.
+        assert_eq!(src.proc_pair_count(), 1);
+        assert_eq!(src.edge_count(), 1);
+    }
+
+    /// Same pair mentioned in N routines → edge weight N (emitted as
+    /// N unit edges, since Edge today doesn't carry a weight field).
+    #[test]
+    fn procedure_cooccurrence_counts_routine_multiplicity() {
+        let sql = r"
+USE `app`;
+CREATE TABLE `a` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+CREATE TABLE `b` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p1`()
+BEGIN
+  SELECT * FROM a JOIN b ON a.id = b.id;
+END ;;
+DELIMITER ;
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p2`()
+BEGIN
+  UPDATE a SET x = (SELECT y FROM b LIMIT 1);
+END ;;
+DELIMITER ;
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p3`()
+BEGIN
+  DELETE FROM a WHERE id IN (SELECT id FROM b);
+END ;;
+DELIMITER ;
+";
+        let src = SqlDumpSource::from_sql(sql).unwrap();
+        assert_eq!(src.proc_pair_count(), 1, "one distinct pair (a, b)");
+        assert_eq!(src.edge_count(), 3, "three unit edges from three routines");
+    }
+
+    /// Tables referenced in a procedure but not declared in the dump
+    /// should be silently dropped from the pair list (same as
+    /// dangling FK policy).
+    #[test]
+    fn procedure_mentions_of_undeclared_tables_are_dropped() {
+        let sql = r"
+USE `app`;
+CREATE TABLE `a` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p1`()
+BEGIN
+  SELECT * FROM a JOIN phantom ON a.id = phantom.id;
+END ;;
+DELIMITER ;
+";
+        let src = SqlDumpSource::from_sql(sql).unwrap();
+        assert_eq!(src.table_count(), 1);
+        // The (a, phantom) pair was discovered but dropped because
+        // phantom isn't a declared table.
+        assert_eq!(src.proc_pair_count(), 0);
+        assert_eq!(src.edge_count(), 0);
+    }
+
+    /// Multi-database qualification works in procedure bodies too —
+    /// `FROM tbl_x` resolves against the current `USE` db.
+    #[test]
+    fn procedure_body_respects_use_db_qualification() {
+        let sql = r"
+USE `db_a`;
+CREATE TABLE `shared` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+CREATE TABLE `a_only` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p_in_a`()
+BEGIN
+  SELECT * FROM shared JOIN a_only;
+END ;;
+DELIMITER ;
+
+USE `db_b`;
+CREATE TABLE `shared` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+CREATE TABLE `b_only` ( `id` int NOT NULL, PRIMARY KEY (`id`) ) ENGINE=InnoDB;
+
+DELIMITER ;;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `p_in_b`()
+BEGIN
+  SELECT * FROM shared JOIN b_only;
+END ;;
+DELIMITER ;
+";
+        let src = SqlDumpSource::from_sql(sql).unwrap();
+        // Four distinct tables: db_a.shared, db_a.a_only,
+        // db_b.shared, db_b.b_only.
+        assert_eq!(src.table_count(), 4);
+        // Two pairs:
+        //   (db_a.a_only, db_a.shared) from p_in_a
+        //   (db_b.b_only, db_b.shared) from p_in_b
+        // No cross-database pair — qualification kept them
+        // separate.
+        assert_eq!(src.proc_pair_count(), 2);
     }
 }

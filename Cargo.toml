@@ -16,6 +16,10 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
+# CLI binary `swindex` (issue #58). Derive feature gives us tidy
+# Args/Subcommand annotations without needing a separate parser dep.
+clap = { version = "4", features = ["derive"] }
+
 [dev-dependencies]
 criterion = "0.5"
 serde_json = "1"

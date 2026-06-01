@@ -3,9 +3,10 @@
 //! # What this module ships
 //!
 //! [`SwIndex`] — the on-disk, query-time face of the four-layer
-//! architecture. It wraps a Fjall keyspace with six partitions
+//! architecture. It wraps a Fjall keyspace with seven partitions
 //! ("keyspaces" in the design doc's vocabulary) that hold the
-//! structural metadata produced by Layers 0–3:
+//! structural metadata produced by Layers 0–3 plus the incremental-
+//! maintenance bookkeeping added in Phase 1 (issue #52):
 //!
 //! | Partition | Key | Value | Purpose |
 //! |-----------|-----|-------|---------|
@@ -15,6 +16,7 @@
 //! | `hub_neighbors`   | hub `Uuid7`    | length-prefixed `Vec<(Uuid7, f32)>` | The hub-graph adjacency |
 //! | `cluster_members` | `ClusterId` (u32 LE) | length-prefixed `Vec<Uuid7>` | "Who's in this cluster?" |
 //! | `cluster_meta`    | `ClusterId` (u32 LE) | `{size: u32, hub_count: u32}` (8 B) | Size + hub count per cluster |
+//! | `cluster_drift`   | `ClusterId` (u32 LE) | `{generation: u64, delta_inserts: u32}` (12 B) | Per-cluster insert pressure since last rebuild (Phase 1) |
 //!
 //! # On-disk footprint
 //!
@@ -38,9 +40,14 @@
 //!   are simple point lookups today. The four-layer routing (region →
 //!   hub-graph → cluster → within-cluster) lives in issue #26 and a
 //!   future PR.
-//! * **Incremental maintenance.** Calling `build_from_source` rebuilds
-//!   everything from scratch. Ada-IVF-style incremental updates are
-//!   issue #27, post-v0.1.
+//! * **Incremental maintenance.** Phase 1 (issue #52) added the
+//!   *interface*: [`SwIndex::insert_node`], [`SwIndex::drift_report`],
+//!   and [`SwIndex::maintain`] with [`crate::maintenance::NeverRebalance`]
+//!   as the stub policy that does nothing. **Real rebalancing
+//!   (threshold-driven Phase 2, full Ada-IVF Phase 3+) is still issue
+//!   #27.** Drift accumulates indefinitely under `NeverRebalance`; for
+//!   quality preservation today, periodically `build_from_source` from
+//!   scratch.
 //! * **Time-travel** (`query_as_of`). Bitemporal history tables in
 //!   Parquet are issue #29, also post-v0.1.
 //!
@@ -70,10 +77,13 @@ use crate::graph::{Graph, GraphError};
 use crate::hub::HubSet;
 use crate::hub_graph::HubGraph;
 use crate::id::Uuid7;
+use crate::maintenance::{ClusterDrift, DriftReport, MaintenancePolicy, MaintenanceReport};
+use crate::node::Node;
 use crate::region::RegionGraph;
 use crate::source::GraphSource;
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use tracing::{debug, debug_span, info, info_span};
@@ -100,13 +110,13 @@ const FORMAT_V1: u8 = 0x01;
 
 /// The persisted small-world property-graph index.
 ///
-/// `SwIndex` wraps a Fjall keyspace plus six partitions. Open one at a
-/// directory path with [`SwIndex::open`]; populate it with
+/// `SwIndex` wraps a Fjall keyspace plus seven partitions. Open one at
+/// a directory path with [`SwIndex::open`]; populate it with
 /// [`SwIndex::build_from_source`]; query it with the various read
 /// accessors. The same path reopened later yields the same data
 /// (durability invariant tested in `round_trip_via_close_and_reopen`).
 pub struct SwIndex {
-    /// The Fjall keyspace owning all six partitions. Held as the last
+    /// The Fjall keyspace owning all partitions. Held as the last
     /// field so its `Drop` runs after all `PartitionHandle` references.
     keyspace: Keyspace,
     uuid_to_cluster: PartitionHandle,
@@ -115,6 +125,12 @@ pub struct SwIndex {
     hub_neighbors: PartitionHandle,
     cluster_members: PartitionHandle,
     cluster_meta: PartitionHandle,
+    /// Per-cluster drift state — `{generation, delta_inserts}` keyed
+    /// by `ClusterId` (u32 LE). Written by `build_from_source`
+    /// (initial generation 0, delta_inserts 0 for every cluster) and
+    /// updated by `insert_node`. Read by `drift_report` and
+    /// `maintain`. New in Phase 1 (issue #52).
+    cluster_drift: PartitionHandle,
 }
 
 /// Errors from any [`SwIndex`] operation.
@@ -306,8 +322,13 @@ impl SwIndex {
         let uuid_is_hub = keyspace.open_partition("uuid_is_hub", opts.clone())?;
         let hub_neighbors = keyspace.open_partition("hub_neighbors", opts.clone())?;
         let cluster_members = keyspace.open_partition("cluster_members", opts.clone())?;
-        let cluster_meta = keyspace.open_partition("cluster_meta", opts)?;
-        debug!("keyspace + 6 partitions opened");
+        let cluster_meta = keyspace.open_partition("cluster_meta", opts.clone())?;
+        // cluster_drift is created lazily — indexes built before Phase 1
+        // simply have an empty partition until the next build_from_source
+        // populates it. Decoders treat "no entry" as `{generation: 0,
+        // delta_inserts: 0}` so reads stay valid in the meantime.
+        let cluster_drift = keyspace.open_partition("cluster_drift", opts)?;
+        debug!("keyspace + 7 partitions opened");
         Ok(Self {
             keyspace,
             uuid_to_cluster,
@@ -316,6 +337,7 @@ impl SwIndex {
             hub_neighbors,
             cluster_members,
             cluster_meta,
+            cluster_drift,
         })
     }
 
@@ -454,6 +476,16 @@ impl SwIndex {
                 &self.cluster_meta,
                 cluster_id.to_le_bytes().as_slice(),
                 encode_cluster_meta(size_u32, hub_count_u32),
+            );
+            // Phase 1: initialize cluster drift to {generation: 0,
+            // delta_inserts: 0} for every cluster created by this
+            // build. Subsequent `insert_node` calls increment
+            // delta_inserts; future `maintain` calls bump generation
+            // when a cluster is rebalanced.
+            batch.insert(
+                &self.cluster_drift,
+                cluster_id.to_le_bytes().as_slice(),
+                encode_cluster_drift(0, 0),
             );
         }
 
@@ -736,6 +768,311 @@ impl SwIndex {
         let raw = self.cluster_meta.get(key.as_slice())?;
         raw.map(|b| decode_cluster_meta(&b)).transpose()
     }
+
+    // =====================================================================
+    // Incremental maintenance (Phase 1 — issue #52)
+    //
+    // The scaffolding for issue #27 / Ada-IVF. `insert_node` appends to
+    // existing structure and increments per-cluster drift counters.
+    // `drift_report` reads them back. `maintain` runs whatever the
+    // supplied [`MaintenancePolicy`] returns — `NeverRebalance` is a
+    // no-op, so this is currently a stub call that does nothing useful
+    // until Phase 2 ships `ThresholdRebalance`.
+    // =====================================================================
+
+    /// Drift state for one cluster. Returns `{generation: 0,
+    /// delta_inserts: 0}` if the cluster has no recorded drift entry
+    /// (e.g. an index built before Phase 1, or a cluster that hasn't
+    /// been touched since the last rebuild).
+    ///
+    /// # Errors
+    ///
+    /// * [`SwIndexError::Fjall`] on a read failure.
+    /// * [`SwIndexError::Corruption`] if the stored payload is malformed.
+    /// * [`SwIndexError::UnsupportedFormat`] if the stored payload was
+    ///   written by a newer swindex with a different format.
+    pub fn cluster_drift(&self, cluster_id: u32) -> Result<(u64, u32), SwIndexError> {
+        let key = cluster_id.to_le_bytes();
+        let raw = self.cluster_drift.get(key.as_slice())?;
+        match raw {
+            Some(b) => decode_cluster_drift(&b),
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Read every cluster's drift state into a [`DriftReport`]. Walks
+    /// the `cluster_drift` partition end-to-end; cost is linear in the
+    /// number of clusters, which is small relative to the node count.
+    ///
+    /// # Errors
+    ///
+    /// * [`SwIndexError::Fjall`] on a read failure.
+    /// * [`SwIndexError::Corruption`] / [`SwIndexError::UnsupportedFormat`]
+    ///   if any payload is malformed.
+    pub fn drift_report(&self) -> Result<DriftReport, SwIndexError> {
+        let _span = info_span!("swindex.drift_report").entered();
+        let mut per_cluster: BTreeMap<u32, ClusterDrift> = BTreeMap::new();
+        for entry in self.cluster_drift.iter() {
+            let (k, v) = entry?;
+            if k.len() != 4 {
+                return Err(SwIndexError::Corruption(format!(
+                    "cluster_drift key expected 4 bytes, got {}",
+                    k.len()
+                )));
+            }
+            let mut id_bytes = [0u8; 4];
+            id_bytes.copy_from_slice(&k);
+            let cluster_id = u32::from_le_bytes(id_bytes);
+            let (generation, delta_inserts) = decode_cluster_drift(&v)?;
+            per_cluster.insert(
+                cluster_id,
+                ClusterDrift {
+                    generation,
+                    delta_inserts,
+                },
+            );
+        }
+        debug!(clusters = per_cluster.len(), "drift report assembled");
+        Ok(DriftReport { per_cluster })
+    }
+
+    /// Append a node to the index, assigning it to an existing cluster
+    /// via majority-vote of its seed neighbors (or to a new singleton
+    /// cluster if none of the seeds are known). Returns the assigned
+    /// cluster id.
+    ///
+    /// # Cluster assignment
+    ///
+    /// 1. Each seed neighbor's current cluster is looked up via
+    ///    [`Self::cluster_of`]. Unknown seeds are silently skipped.
+    /// 2. The cluster with the most votes wins. Ties are broken by
+    ///    **lowest cluster id** so the operation is deterministic.
+    /// 3. If no seed neighbor is known, a new singleton cluster is
+    ///    allocated at `max(existing_cluster_ids) + 1` (or `0` for an
+    ///    empty index). The singleton's region defaults to `0`.
+    ///
+    /// # What's updated atomically
+    ///
+    /// All six structural partitions plus `cluster_drift`, in a single
+    /// Fjall batch followed by `PersistMode::SyncAll`:
+    /// * `uuid_to_cluster`, `uuid_to_region`, `uuid_is_hub` (new node
+    ///   defaults to non-hub)
+    /// * `cluster_members` (member list rewritten with the new uuid
+    ///   sorted in)
+    /// * `cluster_meta` (size incremented; hub_count unchanged because
+    ///   new nodes aren't hubs)
+    /// * `cluster_drift` (delta_inserts incremented for the assigned
+    ///   cluster)
+    ///
+    /// # What this does NOT do
+    ///
+    /// * **No re-clustering.** The new node lands in an existing
+    ///   cluster verbatim; no Leiden pass runs. That's Phase 2+.
+    /// * **No edge insertion.** Seed neighbors inform the cluster
+    ///   choice but no persistent edge is recorded. Add-edge-between-
+    ///   existing-nodes requires re-clustering and is out of scope.
+    /// * **No hub re-detection.** The new node is flagged
+    ///   `uuid_is_hub = false` unconditionally.
+    /// * **No `region` adjustment.** The node inherits the cluster's
+    ///   region (or 0 for a fresh singleton).
+    ///
+    /// # Errors
+    ///
+    /// * [`SwIndexError::Fjall`] on any read/write failure.
+    /// * [`SwIndexError::Corruption`] if existing data is malformed.
+    /// * [`SwIndexError::UnsupportedFormat`] if existing data has an
+    ///   unrecognized format version.
+    pub fn insert_node(
+        &mut self,
+        node: &Node,
+        seed_neighbors: &[Uuid7],
+    ) -> Result<u32, SwIndexError> {
+        let _span =
+            info_span!("swindex.insert_node", uuid = ?node.id, seeds = seed_neighbors.len())
+                .entered();
+
+        // Step 1: tally votes from known seed neighbors. BTreeMap so
+        // iteration order is deterministic for tie-breaking.
+        let mut votes: BTreeMap<u32, usize> = BTreeMap::new();
+        for &seed in seed_neighbors {
+            if let Some(c) = self.cluster_of(seed)? {
+                *votes.entry(c).or_insert(0) += 1;
+            }
+        }
+
+        // Step 2: pick winning cluster, or allocate a new singleton.
+        let assigned: u32 = if votes.is_empty() {
+            self.allocate_next_cluster_id()?
+        } else {
+            // Highest count wins; tie -> lowest cluster id.
+            // BTreeMap iterates in ascending key order, so a stable
+            // max_by_key on count alone gives the *last* (highest-id)
+            // tie-breaker — we want the opposite, so we fold manually.
+            let mut best_id = u32::MAX;
+            let mut best_count = 0_usize;
+            for (&cid, &count) in &votes {
+                if count > best_count {
+                    best_count = count;
+                    best_id = cid;
+                }
+            }
+            best_id
+        };
+
+        // Step 3: resolve region for the assigned cluster.
+        // Existing cluster -> region of any current member. Singleton
+        // -> region 0 (sensible default; no recursive Leiden runs).
+        let assigned_region = self.cluster_region_or_default(assigned)?;
+
+        // Step 4: build the atomic batch.
+        let mut batch = self.keyspace.batch();
+
+        batch.insert(
+            &self.uuid_to_cluster,
+            node.id.as_bytes().as_slice(),
+            assigned.to_le_bytes().as_slice(),
+        );
+        batch.insert(
+            &self.uuid_to_region,
+            node.id.as_bytes().as_slice(),
+            assigned_region.to_le_bytes().as_slice(),
+        );
+        batch.insert(
+            &self.uuid_is_hub,
+            node.id.as_bytes().as_slice(),
+            [0u8].as_slice(),
+        );
+
+        // Update cluster_members: read, push, encode, write. The
+        // member list is small relative to the full index so the
+        // re-encode cost is bounded by cluster size, not graph size.
+        let mut members = self.cluster_members(assigned)?.unwrap_or_default();
+        // Maintain sorted order — `build_from_source` produces members
+        // in cluster-internal order; `insert_node` is the new write
+        // path and sorting keeps `cluster_members(c)` output stable
+        // across rebuild vs. insert.
+        let new_uuid = node.id;
+        match members.binary_search(&new_uuid) {
+            Ok(_) => {
+                // Already present — `insert_node` on an existing uuid
+                // is a contract violation. Bail without mutating
+                // anything.
+                return Err(SwIndexError::Corruption(format!(
+                    "insert_node: uuid {} already exists in the index",
+                    new_uuid.as_uuid()
+                )));
+            }
+            Err(pos) => members.insert(pos, new_uuid),
+        }
+        let members_buf = encode_uuid_vec(&members)?;
+        batch.insert(
+            &self.cluster_members,
+            assigned.to_le_bytes().as_slice(),
+            members_buf,
+        );
+
+        // Update cluster_meta: size += 1; hub_count unchanged (new
+        // nodes aren't hubs in Phase 1).
+        let (existing_size, existing_hub_count) = self.cluster_meta(assigned)?.unwrap_or((0, 0));
+        let new_size = existing_size
+            .checked_add(1)
+            .ok_or_else(|| SwIndexError::Corruption("cluster size overflow on insert".into()))?;
+        batch.insert(
+            &self.cluster_meta,
+            assigned.to_le_bytes().as_slice(),
+            encode_cluster_meta(new_size, existing_hub_count),
+        );
+
+        // Update cluster_drift: delta_inserts += 1; generation unchanged.
+        let (generation, delta) = self.cluster_drift(assigned)?;
+        let new_delta = delta
+            .checked_add(1)
+            .ok_or_else(|| SwIndexError::Corruption("cluster_drift overflow on insert".into()))?;
+        batch.insert(
+            &self.cluster_drift,
+            assigned.to_le_bytes().as_slice(),
+            encode_cluster_drift(generation, new_delta),
+        );
+
+        batch.commit()?;
+        self.keyspace.persist(PersistMode::SyncAll)?;
+        info!(
+            assigned_cluster = assigned,
+            assigned_region, new_size, "insert_node committed"
+        );
+        Ok(assigned)
+    }
+
+    /// Ask the [`MaintenancePolicy`] what (if anything) to do and
+    /// apply its decisions. Phase 1 ships [`NeverRebalance`] which
+    /// always returns an empty action list — so this is a no-op until
+    /// Phase 2 lands real policies.
+    ///
+    /// Returning a [`MaintenanceReport`] even for no-op calls means
+    /// downstream observability (logs, metrics) gets a consistent
+    /// shape regardless of policy.
+    ///
+    /// # Errors
+    ///
+    /// [`SwIndexError::Fjall`] if reading drift state fails. Today
+    /// nothing else can fail; future variants of [`MaintenanceAction`]
+    /// will surface their own errors via this return.
+    pub fn maintain<P: MaintenancePolicy>(
+        &mut self,
+        policy: &P,
+    ) -> Result<MaintenanceReport, SwIndexError> {
+        let _span = info_span!("swindex.maintain").entered();
+        let drift = self.drift_report()?;
+        let actions = policy.decide(&drift);
+        // Phase 1: every variant of MaintenanceAction is a no-op, so
+        // we just thread them into the report. Phase 2 will dispatch
+        // on the variant here.
+        debug!(actions = actions.len(), "policy returned actions");
+        Ok(MaintenanceReport {
+            actions_taken: actions,
+        })
+    }
+
+    /// Find the next free cluster id by scanning existing cluster
+    /// metadata for the current max. Cost is linear in the cluster
+    /// count, which is small (typically `< 100`) relative to the
+    /// node count.
+    ///
+    /// Returns `0` for an empty index.
+    fn allocate_next_cluster_id(&self) -> Result<u32, SwIndexError> {
+        let mut max_id: Option<u32> = None;
+        for entry in self.cluster_meta.iter() {
+            let (k, _v) = entry?;
+            if k.len() != 4 {
+                return Err(SwIndexError::Corruption(format!(
+                    "cluster_meta key expected 4 bytes, got {}",
+                    k.len()
+                )));
+            }
+            let mut id_bytes = [0u8; 4];
+            id_bytes.copy_from_slice(&k);
+            let cluster_id = u32::from_le_bytes(id_bytes);
+            max_id = Some(max_id.map_or(cluster_id, |m| m.max(cluster_id)));
+        }
+        Ok(match max_id {
+            Some(m) => m
+                .checked_add(1)
+                .ok_or_else(|| SwIndexError::Corruption("cluster id space exhausted".into()))?,
+            None => 0,
+        })
+    }
+
+    /// Region id for a cluster, derived from any current member's
+    /// region. Returns `0` for an empty / nonexistent cluster (the
+    /// singleton-allocation default).
+    fn cluster_region_or_default(&self, cluster_id: u32) -> Result<u32, SwIndexError> {
+        if let Some(members) = self.cluster_members(cluster_id)? {
+            if let Some(&first_member) = members.first() {
+                return Ok(self.region_of(first_member)?.unwrap_or(0));
+            }
+        }
+        Ok(0)
+    }
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -879,6 +1216,33 @@ fn encode_cluster_meta(size: u32, hub_count: u32) -> Vec<u8> {
     buf.extend_from_slice(&size.to_le_bytes());
     buf.extend_from_slice(&hub_count.to_le_bytes());
     buf
+}
+
+fn encode_cluster_drift(generation: u64, delta_inserts: u32) -> Vec<u8> {
+    // 1-byte format version + 8-byte generation LE + 4-byte delta_inserts LE = 13 B.
+    let mut buf = Vec::with_capacity(13);
+    buf.push(FORMAT_V1);
+    buf.extend_from_slice(&generation.to_le_bytes());
+    buf.extend_from_slice(&delta_inserts.to_le_bytes());
+    buf
+}
+
+fn decode_cluster_drift(bytes: &[u8]) -> Result<(u64, u32), SwIndexError> {
+    let body = read_format_byte(bytes, "cluster_drift")?;
+    if body.len() != 12 {
+        return Err(SwIndexError::Corruption(format!(
+            "cluster_drift expected 12 body bytes after version, got {}",
+            body.len()
+        )));
+    }
+    let mut gen_bytes = [0u8; 8];
+    gen_bytes.copy_from_slice(&body[0..8]);
+    let mut delta_bytes = [0u8; 4];
+    delta_bytes.copy_from_slice(&body[8..12]);
+    Ok((
+        u64::from_le_bytes(gen_bytes),
+        u32::from_le_bytes(delta_bytes),
+    ))
 }
 
 fn decode_cluster_meta(bytes: &[u8]) -> Result<(u32, u32), SwIndexError> {
@@ -1360,6 +1724,257 @@ mod tests {
             Err(SwIndexError::Corruption(_)) => {}
             other => panic!("expected Corruption for empty payload, got {other:?}"),
         }
+    }
+
+    // =====================================================================
+    // Phase 1 (issue #52): insert_node / drift_report / maintain
+    // =====================================================================
+
+    #[test]
+    fn insert_node_with_known_neighbors_assigns_majority_cluster() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        // The first triangle's nodes (0,1,2) share a cluster. A new
+        // node whose seed neighbors are nodes[0] and nodes[1] should
+        // land in their cluster.
+        let cluster_a = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let new_node = crate::node::Node::fresh(NodeKind::new("v"));
+        let new_uuid = new_node.id;
+        let assigned = idx
+            .insert_node(&new_node, &[nodes[0].id, nodes[1].id])
+            .unwrap();
+
+        assert_eq!(
+            assigned, cluster_a,
+            "majority vote should land in cluster_a"
+        );
+
+        // Inserted node is now queryable.
+        assert_eq!(idx.cluster_of(new_uuid).unwrap(), Some(cluster_a));
+        assert!(
+            !idx.is_hub(new_uuid).unwrap(),
+            "new nodes default to non-hub"
+        );
+
+        // cluster_members now includes the new uuid.
+        let members = idx.cluster_members(cluster_a).unwrap().unwrap();
+        assert!(
+            members.contains(&new_uuid),
+            "new uuid missing from cluster_members"
+        );
+        assert_eq!(members.len(), 4, "cluster_a grew from 3 to 4");
+
+        // cluster_meta size bumped by 1; hub_count unchanged.
+        let (size, _hub_count) = idx.cluster_meta(cluster_a).unwrap().unwrap();
+        assert_eq!(size, 4);
+
+        // cluster_drift recorded the insert.
+        let (gen_, delta) = idx.cluster_drift(cluster_a).unwrap();
+        assert_eq!(gen_, 0, "build set generation to 0");
+        assert_eq!(delta, 1, "exactly one insert into cluster_a");
+    }
+
+    #[test]
+    fn insert_node_tie_breaks_to_lowest_cluster_id() {
+        // One seed from cluster_a, one from cluster_b -> tie -> lower id wins.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let cluster_a = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let cluster_b = idx.cluster_of(nodes[3].id).unwrap().unwrap();
+        let lower = cluster_a.min(cluster_b);
+        let one_from_a = nodes[0].id;
+        let one_from_b = nodes[3].id;
+
+        let new_node = crate::node::Node::fresh(NodeKind::new("v"));
+        let assigned = idx
+            .insert_node(&new_node, &[one_from_a, one_from_b])
+            .unwrap();
+        assert_eq!(assigned, lower, "tie should resolve to lower cluster id");
+    }
+
+    #[test]
+    fn insert_node_with_no_known_seeds_creates_singleton() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let build = idx.build_from_source(&src).unwrap();
+
+        // Seed neighbors are all unknown uuids -> no votes -> singleton.
+        let phantom_a = crate::id::Uuid7::now();
+        let phantom_b = crate::id::Uuid7::now();
+        let new_node = crate::node::Node::fresh(NodeKind::new("v"));
+        let new_uuid = new_node.id;
+        let assigned = idx.insert_node(&new_node, &[phantom_a, phantom_b]).unwrap();
+
+        // New cluster id should be past the build's cluster count.
+        assert!(
+            assigned as usize >= build.clusters,
+            "singleton {assigned} should be at or past existing cluster count {}",
+            build.clusters
+        );
+
+        // The new cluster has exactly one member: the inserted uuid.
+        let members = idx.cluster_members(assigned).unwrap().unwrap();
+        assert_eq!(members, vec![new_uuid]);
+
+        // cluster_meta size = 1; cluster_drift delta = 1.
+        let (size, hub_count) = idx.cluster_meta(assigned).unwrap().unwrap();
+        assert_eq!((size, hub_count), (1, 0));
+        let (_gen, delta) = idx.cluster_drift(assigned).unwrap();
+        assert_eq!(delta, 1);
+    }
+
+    #[test]
+    fn insert_node_with_empty_seeds_creates_singleton() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let build = idx.build_from_source(&src).unwrap();
+
+        let new_node = crate::node::Node::fresh(NodeKind::new("v"));
+        let assigned = idx.insert_node(&new_node, &[]).unwrap();
+        assert!(assigned as usize >= build.clusters);
+    }
+
+    #[test]
+    fn insert_node_rejects_duplicate_uuid() {
+        // Inserting a uuid that already exists is a contract violation
+        // — Phase 1 surfaces it as a Corruption error rather than
+        // silently double-counting drift.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        // Re-insert one of the original nodes — same uuid.
+        let dup = crate::node::Node {
+            id: nodes[0].id,
+            kind: NodeKind::new("v"),
+        };
+        let err = idx.insert_node(&dup, &[nodes[1].id]).unwrap_err();
+        match err {
+            SwIndexError::Corruption(msg) => assert!(
+                msg.contains("already exists"),
+                "expected duplicate-uuid corruption, got {msg}"
+            ),
+            other => panic!("expected Corruption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_report_after_inserts_matches_individual_lookups() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let build = idx.build_from_source(&src).unwrap();
+
+        let cluster_a = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let cluster_b = idx.cluster_of(nodes[3].id).unwrap().unwrap();
+
+        // 2 inserts into cluster_a, 1 into cluster_b.
+        for _ in 0..2 {
+            let n = crate::node::Node::fresh(NodeKind::new("v"));
+            idx.insert_node(&n, &[nodes[0].id]).unwrap();
+        }
+        let n = crate::node::Node::fresh(NodeKind::new("v"));
+        idx.insert_node(&n, &[nodes[3].id]).unwrap();
+
+        let report = idx.drift_report().unwrap();
+        assert_eq!(
+            report.cluster_count(),
+            build.clusters,
+            "drift report should cover every cluster from the build"
+        );
+        assert_eq!(report.total_inserts(), 3);
+        assert_eq!(report.per_cluster.get(&cluster_a).unwrap().delta_inserts, 2);
+        assert_eq!(report.per_cluster.get(&cluster_b).unwrap().delta_inserts, 1);
+
+        // Cross-check: drift_report and cluster_drift agree per cluster.
+        for (&cid, cd) in &report.per_cluster {
+            let (gen_, delta) = idx.cluster_drift(cid).unwrap();
+            assert_eq!(cd.generation, gen_);
+            assert_eq!(cd.delta_inserts, delta);
+        }
+    }
+
+    #[test]
+    fn maintain_with_never_rebalance_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        // Generate some drift so the policy has something to look at.
+        for _ in 0..5 {
+            let n = crate::node::Node::fresh(NodeKind::new("v"));
+            idx.insert_node(&n, &[nodes[0].id]).unwrap();
+        }
+
+        // Snapshot state before maintain.
+        let drift_before = idx.drift_report().unwrap();
+        let cluster_a = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let (size_before, _) = idx.cluster_meta(cluster_a).unwrap().unwrap();
+
+        let report = idx.maintain(&crate::maintenance::NeverRebalance).unwrap();
+        assert!(
+            report.actions_taken.is_empty(),
+            "NeverRebalance should return no actions"
+        );
+
+        // Nothing changed.
+        let drift_after = idx.drift_report().unwrap();
+        assert_eq!(
+            drift_after.total_inserts(),
+            drift_before.total_inserts(),
+            "maintain with NeverRebalance must not reset drift"
+        );
+        let (size_after, _) = idx.cluster_meta(cluster_a).unwrap().unwrap();
+        assert_eq!(size_after, size_before);
+    }
+
+    #[test]
+    fn insert_node_survives_close_and_reopen() {
+        // Persistence invariant for the new write path: insert, close,
+        // reopen, confirm the insert stuck.
+        let dir = TempDir::new().unwrap();
+        let new_uuid;
+        let assigned_cluster;
+        {
+            let mut idx = SwIndex::open(dir.path()).unwrap();
+            let (nodes, edges) = two_disjoint_triangles();
+            let src = SliceSource::new(&nodes, &edges);
+            idx.build_from_source(&src).unwrap();
+            let new_node = crate::node::Node::fresh(NodeKind::new("v"));
+            new_uuid = new_node.id;
+            assigned_cluster = idx.insert_node(&new_node, &[nodes[0].id]).unwrap();
+        }
+
+        let reopened = SwIndex::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.cluster_of(new_uuid).unwrap(),
+            Some(assigned_cluster)
+        );
+        let (_gen, delta) = reopened.cluster_drift(assigned_cluster).unwrap();
+        assert_eq!(delta, 1, "drift counter must survive close/reopen");
+
+        // Query still works post-insert.
+        let result = reopened
+            .query(QueryKind::SameCluster { start: new_uuid })
+            .unwrap();
+        assert!(result.uuids.contains(&new_uuid));
     }
 
     #[test]

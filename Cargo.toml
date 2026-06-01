@@ -1,6 +1,6 @@
 [package]
 name = "swindex"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 rust-version = "1.85"
 description = "Hierarchical small-world property-graph index — Leiden communities + hub-aware navigation + incremental maintenance."
@@ -11,11 +11,13 @@ categories = ["data-structures", "algorithms", "database"]
 keywords = ["graph", "index", "leiden", "small-world", "hnsw"]
 
 [dependencies]
-uuid = { version = "1", features = ["v7", "serde"] }
+fjall = "2"
 serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

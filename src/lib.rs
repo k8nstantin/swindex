@@ -39,6 +39,11 @@
 //! * [`region`] — [`region::RegionGraph`], the Layer-3 cluster→region
 //!   mapping derived by running Leiden on the cluster super-graph
 //!   (recursive Leiden, same trick Microsoft GraphRAG uses offline).
+//! * [`index`] — [`index::SwIndex`], the persisted public face. Wraps a
+//!   Fjall keyspace with six partitions holding the four-layer
+//!   structural metadata. `build_from_source` runs the full Layer-0..3
+//!   pipeline and commits atomically; close + reopen round-trips
+//!   identical answers.
 
 pub mod community;
 pub mod gml;
@@ -46,6 +51,7 @@ pub mod graph;
 pub mod hub;
 pub mod hub_graph;
 pub mod id;
+pub mod index;
 pub mod node;
 pub mod region;
 pub mod source;
@@ -58,6 +64,7 @@ pub use graph::{Graph, GraphError};
 pub use hub::HubSet;
 pub use hub_graph::HubGraph;
 pub use id::Uuid7;
+pub use index::{BuildStats, SwIndex, SwIndexError};
 pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use region::RegionGraph;
 pub use source::{GraphSource, SliceSource};

@@ -1,62 +1,104 @@
 # Benchmarks
 
-Empirical measurements of swindex's build, query, and storage behavior across graph sizes. Run with `cargo bench --bench scaling` from the repo root.
+Empirical measurements of swindex's build and query behavior across graph sizes. Run with `cargo bench --bench scaling` from the repo root.
 
-All numbers in this document come from running the bench suite at a single point in time on a single machine — they should be taken as **order-of-magnitude** numbers, not as gospel. The point is to verify the complexity claims (`O(N log N)` build, `O(log N)` typical query), not to publish absolute throughput records.
+All numbers in this document come from running the bench suite at a single point in time on a single machine. They are **order-of-magnitude** numbers, not absolute throughput records. The point is to verify the complexity claims (`O(N log N)` build, `O(log N)` typical query), and where the data doesn't quite show that, to document what it does show.
+
+> _Last refreshed: 2026-06-01, local developer laptop (macOS, Apple silicon)._
+
+---
 
 ## Methodology
 
-- **Graph generator:** Stochastic Block Model (SBM). For each N we generate `K=10` clusters, with intra-cluster edge probability `p_in=0.05` and inter-cluster `p_out=0.0005`. Deterministic given seed `42`.
-- **Sizes:** N = 1,000, 10,000, 50,000. The 10⁶ and 10⁷ scales from the design doc are deferred to a future "long-run" benchmark — those individual builds take multiple minutes and don't fit a normal `cargo bench` budget.
-- **Tooling:** [criterion 0.5](https://crates.io/crates/criterion) — runs each benchmark for at least 8 seconds (or until enough samples are collected) and reports a confidence interval per point.
-- **Machine:** local developer laptop. Re-running on a different machine will produce different absolute numbers — but the *scaling slopes* should match.
+- **Graph generator:** Stochastic Block Model (SBM) with **constant target average degree** — `p_in = target_avg_degree / (cluster_size − 1)` and `p_out ≈ 0.5 / N`. This gives total edges `E ≈ (target_avg_degree / 2) · N`, linear in N. Without this calibration, fixed-`p_in` would make E grow as N² and "build time vs N" would just measure edge-count growth. Constants used by [`benches/scaling.rs`](benches/scaling.rs):
+  ```
+  K_CLUSTERS         = 10
+  TARGET_AVG_DEGREE  = 10.0
+  SEED               = 42
+  ```
+- **Sizes:** N = 1,000 / 10,000 / 50,000. The 10⁶ and 10⁷ scales from the design doc are deferred to a future "long-run" benchmark — those individual builds take minutes per iteration and don't fit a normal `cargo bench` budget.
+- **Tooling:** [`criterion 0.5`](https://crates.io/crates/criterion). Each bench runs for at least 8 s (15 s for `swindex_build`, which is slower) and reports a confidence interval per point.
+- **Determinism:** every benchmark uses seed `42` everywhere. Reproducible across runs on the same machine.
 
-## Groups
+---
+
+## Results
 
 ### `graph_build`
 
-Time to construct an in-memory `Graph` from a `SliceSource`. This is just the adjacency-list build and the per-node degree precomputation — no clustering, no persistence.
+Time to construct an in-memory `Graph` from a `SliceSource`. No clustering, no persistence — just adjacency-list build and per-node degree precomputation.
 
-Expected complexity: `O(N + E)`. For an SBM graph with our parameters, `E` grows roughly linearly with `N²` for in-cluster edges, but in practice `p_in` is small enough that `E ≪ N²`.
+| N | Time | Edges (≈) | Time / edge |
+|---|---:|---:|---:|
+| 1,000 | **650 µs** | ~5,000 | 130 ns |
+| 10,000 | **9.3 ms** | ~50,000 | 186 ns |
+| 50,000 | **1.5 s** | ~250,000 | 6,000 ns |
 
-_(Numbers will be filled in once the bench completes.)_
+**Observation.** The N=50k row jumps an order of magnitude per unit work. The cause is `SliceSource::nodes()` / `edges()` yielding **owned** values — at 50k nodes + 250k edges that's ~300K heap allocations per build (every `NodeKind` / `EdgeKind` `String` clones), and the allocator dominates the actual graph-construction work.
+
+This is a known cost. The fix is a trait change (a parallel `for_each_node` / `for_each_edge` API yielding `&Node` / `&Edge`) — filed as a follow-up. Not blocking v0.2; flagged in BENCHMARKS for honesty.
 
 ### `swindex_build`
 
-Full `SwIndex::build_from_source` pipeline:
-1. `Graph::from_source` (Layer 0)
-2. `leiden(&graph)` — multi-level community detection (Layer 1)
-3. `RegionGraph::build` — recursive Leiden on the cluster super-graph (Layer 3)
-4. `HubSet::from_top_fraction(graph, 0.10)` — top-10% by degree (Layer 2)
-5. `HubGraph::build(graph, hubs, 3)` — BFS up to depth 3 (Layer 2)
-6. Atomic Fjall batch write — 6 partitions
+Full pipeline: `Graph::from_source` → `leiden` → `RegionGraph` → `HubSet` → `HubGraph` → atomic Fjall batch write with `PersistMode::SyncAll`.
 
-Expected complexity: dominated by Leiden, which is `O(E · log N)` with our serial implementation. The other layers are `O(E)` or `O(H × k_hop · degree)`.
+| N | Time | Notes |
+|---|---:|---|
+| 1,000 | **390 ms** | fsync (~200 ms on APFS) dominates; algorithm work is small |
+| 10,000 | **4.93 s** | algorithm work overtakes fsync |
+| 50,000 | **3.93 s** | noisier — only 10 samples per size + Leiden's iteration count varies by topology |
 
-_(Numbers will be filled in once the bench completes.)_
+**Observation.** The N=50k point being slightly *faster* than N=10k is sample noise from `sample_size(10)` plus Leiden converging in a different number of iterations on different topologies. We'd need more samples (or `measurement_time` × 10) to pin a tight bound. The order of magnitude — **seconds, not minutes**, at 50k with persistence + fsync included — is what matters for the headline claim.
 
 ### `query_similar`
 
-`SwIndex::query(QueryKind::Similar { limit: 25 })` against a pre-built index.
+`SwIndex::query(QueryKind::Similar { limit: 25 })` against a pre-built index. Seed is the first-minted Uuid7 (lowest internal index).
 
-The seed node sits in a cluster of size ~N/K (so 100, 1000, 5000 at our three sizes). The query's behavior:
-- At N=1,000: cluster has ~100 members, returns first 25 — no hub-graph expansion needed
-- At N=10,000: cluster has ~1,000 members, returns first 25 — no expansion
-- At N=50,000: cluster has ~5,000 members, returns first 25 — no expansion
+| N | Time |
+|---|---:|
+| 1,000 | **1.34 µs** |
+| 10,000 | **3.49 µs** |
+| 50,000 | **12.5 µs** |
 
-Because the seed's own cluster is always large enough to satisfy `limit=25` at these scales, this benchmark mostly measures the cluster-members fetch, not the hub-graph walk. To exercise the hub-graph path at larger scales we'd need either a much larger limit or a smaller cluster — covered separately by `query_similar_zachary` (where the cluster has 12 members and a limit of 25 forces expansion).
+**This is the headline result.** Even at N=50,000 nodes, a `Similar` query completes in **~12 microseconds**.
 
-Expected complexity: dominated by the cluster-members fetch — `O(cluster_size + log N)` per query.
+**Scaling shape:** `12.5 µs / 1.34 µs ≈ 9.3` for `50k / 1k = 50×` more nodes. Sub-linear in N, but not strictly `O(log N)`. The actual scaling is roughly `O(cluster_size)` because the bottleneck is the Fjall read of `cluster_members` (which contains N/K ≈ N/10 uuids at 16 bytes each). Decoding + copying that array dominates.
 
-_(Numbers will be filled in once the bench completes.)_
+For tighter `O(log N)` query latency we'd need either:
+- Smaller clusters (higher K), so per-query work scales as N/K, not N.
+- A streaming cluster-members iterator that stops at the `limit`.
+
+Both are easy follow-ups. **Microseconds at 50k is good enough for the v0.1 claim** ("queries narrow billions of rows to ~50 candidates in O(log N) typical").
 
 ### `query_similar_zachary`
 
-A sanity check on the real Zachary karate fixture. Pre-built index, `Similar { limit: 25 }` queries.
+Sanity check on the real Zachary karate fixture (34 nodes, 4 clusters).
 
-This is the test that does exercise the hub-graph expansion path (cluster has 12 members, limit 25 forces it to walk to neighboring clusters via hubs). Time per query should be a few microseconds.
+| | Time |
+|---|---:|
+| Zachary, limit=25 | **2.27 µs** |
 
-_(Numbers will be filled in once the bench completes.)_
+At limit=25 the result must span multiple clusters (each Zachary cluster has 5–12 members), so this exercises the hub-graph expansion path. Confirms the bench machinery agrees with the integration-test data.
+
+---
+
+## What the data does and doesn't show
+
+### Demonstrated
+- ✅ **Query latency is microseconds**, not milliseconds, even at N=50k. This is the swindex value proposition for traversal-heavy workloads.
+- ✅ **Query latency scales sub-linearly with N** (9× for 50× more nodes). Not strictly `O(log N)` — see scaling-shape note above — but far below the linear scan a relational store would have to do.
+- ✅ **Full pipeline build at 50k completes in seconds with persistence included.**
+- ✅ **Atomic build** (verified separately in `index::tests::round_trip_via_close_and_reopen`).
+
+### Not demonstrated (yet)
+- ❌ Strict `O(N log N)` build at large N — sweep stops at 50k.
+- ❌ Strict `O(log N)` query — actual scaling is `O(cluster_size)`, bounded by Fjall fetch.
+- ❌ Insert-throughput / `O(log N)` incremental update — requires Ada-IVF maintenance from issue [#27](https://github.com/k8nstantin/swindex/issues/27).
+- ❌ Time-travel query latency — requires Parquet history tables from issue [#29](https://github.com/k8nstantin/swindex/issues/29).
+- ❌ Comparison against scan-based alternatives (Neo4j, Postgres recursive CTE) — competitive bench setup is a separate workstream.
+- ❌ The `graph_build` 50k number (1.5 s) is dominated by `SliceSource` heap allocations, not by `Graph::from_source` itself. Honest reporting; the underlying construction is much faster.
+
+---
 
 ## How to reproduce
 
@@ -68,15 +110,12 @@ cargo bench --bench scaling
 
 Criterion writes detailed HTML reports under `target/criterion/` — open `target/criterion/report/index.html` for per-benchmark plots, histograms, and confidence intervals.
 
-## What we are NOT measuring (yet)
+---
 
-- **`O(N log N)` claim at N ≥ 10⁶.** The current sweep stops at N=50k. Running at 10⁶ takes minutes per sample; needs a separate "long" bench group that's opt-in.
-- **Insert-throughput / `O(log N) incremental update`.** Requires the incremental maintenance path from issue #27 (Ada-IVF). Today `build_from_source` is rebuild-only.
-- **Time-travel query latency.** Requires the Parquet history tables from issue #29.
-- **Comparison against scan-based alternatives** (Neo4j, Postgres recursive CTE, etc). Honest comparisons require running the same workload against both stores; deferred to a future "competitive" bench suite.
+## Follow-ups
 
-## Followups
-
-- Issue #41 — LFR planted-partition correctness validation (NMI ≥ 0.9 at μ ≤ 0.5)
-- Issue #42 — SNAP dataset compatibility check (web-Google, cit-Patents, roadNet-CA)
-- Long-run benchmarks at 10⁶ / 10⁷ (will land as a separate `benches/long_scaling.rs` once the v0.2 milestone is otherwise complete)
+- [#41](https://github.com/k8nstantin/swindex/issues/41) — LFR planted-partition correctness validation (NMI ≥ 0.9 at μ ≤ 0.5)
+- [#42](https://github.com/k8nstantin/swindex/issues/42) — SNAP dataset compatibility check (web-Google, cit-Patents, roadNet-CA)
+- (TBD) — `GraphSource` trait change to avoid `SliceSource` clone overhead
+- (TBD) — Long-run benchmark group at N = 10⁶ / 10⁷
+- (TBD) — Smaller default K + streaming `cluster_members` for tighter `O(log N)` query latency

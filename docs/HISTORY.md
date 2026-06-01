@@ -1,3 +1,13 @@
+# HISTORY — swindex bootstrap notes (archival)
+
+> **Status: archival.** This file was the bootstrap plan written before any code existed (May 2026, when this was called `deployment_plan.md` at the repo root). It captures the original intent: install Rust, scaffold the crate, get Leiden running on Zachary, build outward.
+>
+> Most of what's described here was followed in spirit but not in detail — the dependencies listed (`petgraph`, `proptest`, etc.) are not what ended up in `Cargo.toml`. The actual v0.1.0 stack is `fjall`, `uuid`, `serde` per `Cargo.toml`.
+>
+> Kept for historical reference. For the actual project state see `README.md`, `DESIGN.md`, `CHANGELOG.md`, and the open issues on GitHub.
+
+---
+
 # swindex — Get It Installed and Working
 
 Cut the bullshit. Here's how to bootstrap the index library and prove it works.

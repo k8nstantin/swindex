@@ -93,6 +93,30 @@ pub trait GraphSource {
     fn edge_count_hint(&self) -> Option<usize> {
         None
     }
+
+    /// Optional human-readable label for a node. Returns `None` if the
+    /// source has no name to attach (the default — many sources are
+    /// label-less; e.g. raw `SliceSource` over freshly-minted
+    /// `Uuid7`s has nothing meaningful to surface).
+    ///
+    /// Sources that know names — [`crate::sql_dump::SqlDumpSource`]
+    /// knows table names, a future `MysqlMetaSource` will know
+    /// `db.table` names — should override this method. The index
+    /// builder calls it once per node during `build_from_source`;
+    /// returned labels are persisted alongside structural data and
+    /// surface back through `SwIndex::label_of` and
+    /// `SwIndex::query_by_label`. Without labels the index works
+    /// fine — it's just `Uuid7`-only at query time.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `None`. Backwards-compatible: every existing
+    /// `GraphSource` impl that doesn't override gets "no labels"
+    /// behavior, identical to v0.1.0.
+    fn label_of(&self, node_id: crate::id::Uuid7) -> Option<String> {
+        let _ = node_id;
+        None
+    }
 }
 
 /// A [`GraphSource`] backed by two slices held in memory.

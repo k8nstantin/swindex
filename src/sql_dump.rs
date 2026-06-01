@@ -225,6 +225,16 @@ impl GraphSource for SqlDumpSource {
     fn edge_count_hint(&self) -> Option<usize> {
         Some(self.edges.len())
     }
+
+    /// Reverse the internal `name_to_uuid` map at call time to return
+    /// the qualified table name (`db.table`) for this uuid. O(N) scan
+    /// per call — fine because `build_from_source` calls this once per
+    /// node during a build, never on the query hot path.
+    fn label_of(&self, node_id: Uuid7) -> Option<String> {
+        self.name_to_uuid
+            .iter()
+            .find_map(|(name, &id)| (id == node_id).then(|| name.clone()))
+    }
 }
 
 // =========================================================================

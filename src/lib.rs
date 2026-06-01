@@ -67,7 +67,10 @@ pub use graph::{Graph, GraphError};
 pub use hub::HubSet;
 pub use hub_graph::HubGraph;
 pub use id::Uuid7;
-pub use index::{BuildStats, QueryKind, QueryResult, QueryStats, SwIndex, SwIndexError, SwStats};
+pub use index::{
+    BuildStats, QueryKind, QueryKindByLabel, QueryResult, QueryResultByLabel, QueryStats, SwIndex,
+    SwIndexError, SwStats,
+};
 pub use maintenance::{
     ClusterDrift, DriftReport, MaintenanceAction, MaintenancePolicy, MaintenanceReport,
     NeverRebalance,

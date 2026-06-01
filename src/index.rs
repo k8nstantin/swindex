@@ -110,7 +110,7 @@ const FORMAT_V1: u8 = 0x01;
 
 /// The persisted small-world property-graph index.
 ///
-/// `SwIndex` wraps a Fjall keyspace plus seven partitions. Open one at
+/// `SwIndex` wraps a Fjall keyspace plus nine partitions. Open one at
 /// a directory path with [`SwIndex::open`]; populate it with
 /// [`SwIndex::build_from_source`]; query it with the various read
 /// accessors. The same path reopened later yields the same data
@@ -125,6 +125,14 @@ pub struct SwIndex {
     hub_neighbors: PartitionHandle,
     cluster_members: PartitionHandle,
     cluster_meta: PartitionHandle,
+    /// `Uuid7` → human-readable label (e.g. `db.table` for SQL
+    /// sources). Variable-length value: `FORMAT_V1` byte + UTF-8 bytes.
+    /// Populated by `build_from_source` for nodes whose source
+    /// returns `Some` from `GraphSource::label_of`. New in PR #57.
+    labels: PartitionHandle,
+    /// Reverse index: label bytes → `Uuid7`. O(1) `uuid_of_label`
+    /// lookup without scanning `labels`. New in PR #57.
+    label_to_uuid: PartitionHandle,
     /// Per-cluster drift state — `{generation, delta_inserts}` keyed
     /// by `ClusterId` (u32 LE). Written by `build_from_source`
     /// (initial generation 0, delta_inserts 0 for every cluster) and
@@ -283,6 +291,49 @@ pub struct QueryResult {
     pub stats: QueryStats,
 }
 
+/// What kind of label-based query to run. Names mirror [`QueryKind`]
+/// exactly — the label variant resolves to a uuid via
+/// [`SwIndex::uuid_of_label`] and then dispatches identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryKindByLabel {
+    /// Find tables in the same cluster as the seed by label.
+    SameCluster {
+        /// The seed table's label (e.g. `"db_a.tbl_customer"`).
+        start: String,
+    },
+    /// Find tables structurally similar to the seed by label, up to
+    /// `limit` results.
+    Similar {
+        /// The seed table's label.
+        start: String,
+        /// Maximum number of results.
+        limit: usize,
+    },
+}
+
+/// Result of a label-based query. `labels` mirrors `QueryResult::uuids`
+/// in priority order, except every uuid has been mapped back to its
+/// human-readable label (or the uuid hex string if no label was
+/// registered for that node).
+#[derive(Debug, Clone, Default)]
+pub struct QueryResultByLabel {
+    /// Result labels in priority order — same cluster first, then
+    /// expansion via hub graph.
+    pub labels: Vec<String>,
+    /// Routing telemetry — identical to [`QueryResult::stats`].
+    pub stats: QueryStats,
+}
+
+impl QueryResultByLabel {
+    /// Empty result with default stats. Used when a seed label
+    /// doesn't resolve (unknown table) — the caller gets an empty
+    /// `labels` vec rather than an error.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// Counts of what's currently stored in the index — for introspection
 /// and benchmarking. Cheap to compute (uses Fjall's
 /// `approximate_len`); not authoritative under concurrent writes but
@@ -323,12 +374,18 @@ impl SwIndex {
         let hub_neighbors = keyspace.open_partition("hub_neighbors", opts.clone())?;
         let cluster_members = keyspace.open_partition("cluster_members", opts.clone())?;
         let cluster_meta = keyspace.open_partition("cluster_meta", opts.clone())?;
+        // labels and label_to_uuid are created lazily — indexes built
+        // before PR #57 simply have empty partitions until a fresh
+        // build populates them. label_of returns None for missing
+        // entries; uuid_of_label returns None. No migration required.
+        let labels = keyspace.open_partition("labels", opts.clone())?;
+        let label_to_uuid = keyspace.open_partition("label_to_uuid", opts.clone())?;
         // cluster_drift is created lazily — indexes built before Phase 1
         // simply have an empty partition until the next build_from_source
         // populates it. Decoders treat "no entry" as `{generation: 0,
         // delta_inserts: 0}` so reads stay valid in the meantime.
         let cluster_drift = keyspace.open_partition("cluster_drift", opts)?;
-        debug!("keyspace + 7 partitions opened");
+        debug!("keyspace + 9 partitions opened");
         Ok(Self {
             keyspace,
             uuid_to_cluster,
@@ -337,6 +394,8 @@ impl SwIndex {
             hub_neighbors,
             cluster_members,
             cluster_meta,
+            labels,
+            label_to_uuid,
             cluster_drift,
         })
     }
@@ -435,6 +494,22 @@ impl SwIndex {
                 uuid.as_bytes().as_slice(),
                 [u8::from(hubs.contains(u))].as_slice(),
             );
+
+            // Labels (PR #57): ask the source for a human name; write
+            // forward + reverse partitions if it returns one. Sources
+            // without labels (default) get no entries here.
+            if let Some(label) = source.label_of(uuid) {
+                batch.insert(
+                    &self.labels,
+                    uuid.as_bytes().as_slice(),
+                    encode_label(&label),
+                );
+                batch.insert(
+                    &self.label_to_uuid,
+                    label.as_bytes(),
+                    uuid.as_bytes().as_slice(),
+                );
+            }
         }
 
         // Hub neighbors: serialize each hub's adjacency list.
@@ -767,6 +842,117 @@ impl SwIndex {
         let key = cluster_id.to_le_bytes();
         let raw = self.cluster_meta.get(key.as_slice())?;
         raw.map(|b| decode_cluster_meta(&b)).transpose()
+    }
+
+    // =====================================================================
+    // Labels (PR #57 — issue #55) — human-readable name persistence
+    // =====================================================================
+
+    /// Human-readable label for a node (e.g. `db.table` for SQL
+    /// sources), or `None` if no label was registered at build time.
+    ///
+    /// # Errors
+    ///
+    /// * [`SwIndexError::Fjall`] on a read failure.
+    /// * [`SwIndexError::Corruption`] / [`SwIndexError::UnsupportedFormat`]
+    ///   if the stored payload is malformed.
+    pub fn label_of(&self, uuid: Uuid7) -> Result<Option<String>, SwIndexError> {
+        let raw = self.labels.get(uuid.as_bytes().as_slice())?;
+        raw.map(|b| decode_label(&b)).transpose()
+    }
+
+    /// Reverse lookup: `Uuid7` of a node by its label. Returns `None`
+    /// if the label isn't in the index.
+    ///
+    /// # Errors
+    ///
+    /// [`SwIndexError::Fjall`] on a read failure.
+    /// [`SwIndexError::Corruption`] if the stored uuid is the wrong size.
+    pub fn uuid_of_label(&self, label: &str) -> Result<Option<Uuid7>, SwIndexError> {
+        let raw = self.label_to_uuid.get(label.as_bytes())?;
+        raw.map(|b| {
+            if b.len() != 16 {
+                return Err(SwIndexError::Corruption(format!(
+                    "label_to_uuid expected 16 bytes, got {}",
+                    b.len()
+                )));
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&b);
+            Uuid7::from_uuid(Uuid::from_bytes(bytes)).ok_or_else(|| {
+                SwIndexError::Corruption("label_to_uuid stored a non-v7 uuid".into())
+            })
+        })
+        .transpose()
+    }
+
+    /// Run a label-based query — resolve the label to a uuid, run the
+    /// underlying [`Self::query`], then map result uuids back to
+    /// their labels.
+    ///
+    /// Returns an empty result (not an error) if the seed label is
+    /// not in the index — that's the right ergonomics for "tell me
+    /// what's like X" where X may not exist.
+    ///
+    /// Result uuids that have no label registered are mapped to
+    /// their raw uuid hex string so the caller always gets something
+    /// human-readable.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any underlying [`SwIndexError`] from the resolution
+    /// or query phases.
+    // Takes `QueryKindByLabel` by value for ergonomic parity with
+    // `query(QueryKind)` even though it contains a non-Copy String.
+    // The clippy lint suggests `&` but that complicates the call
+    // site for marginal benefit.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn query_by_label(
+        &self,
+        query: QueryKindByLabel,
+    ) -> Result<QueryResultByLabel, SwIndexError> {
+        let _span = info_span!("swindex.query_by_label", kind = ?query).entered();
+
+        // Resolve the seed label → uuid. Empty result if unknown.
+        let (seed_uuid, structural_query) = match &query {
+            QueryKindByLabel::Similar { start, limit } => {
+                let Some(uuid) = self.uuid_of_label(start)? else {
+                    return Ok(QueryResultByLabel::empty());
+                };
+                (
+                    uuid,
+                    QueryKind::Similar {
+                        start: uuid,
+                        limit: *limit,
+                    },
+                )
+            }
+            QueryKindByLabel::SameCluster { start } => {
+                let Some(uuid) = self.uuid_of_label(start)? else {
+                    return Ok(QueryResultByLabel::empty());
+                };
+                (uuid, QueryKind::SameCluster { start: uuid })
+            }
+        };
+        let _ = seed_uuid;
+
+        let result = self.query(structural_query)?;
+
+        // Map every result uuid back to its label. Uuids without
+        // labels fall back to their hex representation so the
+        // caller always gets a printable string.
+        let mut labels = Vec::with_capacity(result.uuids.len());
+        for uuid in &result.uuids {
+            let label = self
+                .label_of(*uuid)?
+                .unwrap_or_else(|| uuid.as_uuid().to_string());
+            labels.push(label);
+        }
+
+        Ok(QueryResultByLabel {
+            labels,
+            stats: result.stats,
+        })
     }
 
     // =====================================================================
@@ -1227,6 +1413,22 @@ fn encode_cluster_drift(generation: u64, delta_inserts: u32) -> Vec<u8> {
     buf
 }
 
+fn encode_label(label: &str) -> Vec<u8> {
+    // 1-byte format version + raw UTF-8 bytes. Length is implicit
+    // in the value's storage size — Fjall preserves byte length on
+    // get(), so no explicit length prefix is needed.
+    let mut buf = Vec::with_capacity(1 + label.len());
+    buf.push(FORMAT_V1);
+    buf.extend_from_slice(label.as_bytes());
+    buf
+}
+
+fn decode_label(bytes: &[u8]) -> Result<String, SwIndexError> {
+    let body = read_format_byte(bytes, "labels")?;
+    String::from_utf8(body.to_vec())
+        .map_err(|e| SwIndexError::Corruption(format!("labels: invalid UTF-8: {e}")))
+}
+
 fn decode_cluster_drift(bytes: &[u8]) -> Result<(u64, u32), SwIndexError> {
     let body = read_format_byte(bytes, "cluster_drift")?;
     if body.len() != 12 {
@@ -1278,9 +1480,9 @@ fn decode_u32(bytes: &[u8], context: &str) -> Result<u32, SwIndexError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildStats, FORMAT_V1, QueryKind, SwIndex, SwIndexError, decode_cluster_meta,
-        decode_hub_neighbors, decode_uuid_vec, encode_cluster_meta, encode_hub_neighbors,
-        encode_uuid_vec,
+        BuildStats, FORMAT_V1, QueryKind, QueryKindByLabel, SwIndex, SwIndexError,
+        decode_cluster_meta, decode_hub_neighbors, decode_uuid_vec, encode_cluster_meta,
+        encode_hub_neighbors, encode_uuid_vec,
     };
     use crate::id::Uuid7;
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
@@ -1975,6 +2177,178 @@ mod tests {
             .query(QueryKind::SameCluster { start: new_uuid })
             .unwrap();
         assert!(result.uuids.contains(&new_uuid));
+    }
+
+    // =====================================================================
+    // Labels (PR #57 — issue #55)
+    // =====================================================================
+
+    /// A test `GraphSource` that wraps `SliceSource` and adds simple
+    /// per-uuid labels. Lets us exercise the label persistence path
+    /// without needing a SqlDumpSource.
+    struct LabeledSliceSource<'a> {
+        inner: SliceSource<'a>,
+        labels: std::collections::BTreeMap<crate::id::Uuid7, String>,
+    }
+
+    impl<'a> LabeledSliceSource<'a> {
+        fn new(
+            nodes: &'a [crate::node::Node],
+            edges: &'a [Edge],
+            labels: std::collections::BTreeMap<crate::id::Uuid7, String>,
+        ) -> Self {
+            Self {
+                inner: SliceSource::new(nodes, edges),
+                labels,
+            }
+        }
+    }
+
+    impl GraphSource for LabeledSliceSource<'_> {
+        fn nodes(&self) -> impl Iterator<Item = crate::node::Node> + '_ {
+            self.inner.nodes()
+        }
+        fn edges(&self) -> impl Iterator<Item = Edge> + '_ {
+            self.inner.edges()
+        }
+        fn label_of(&self, node_id: crate::id::Uuid7) -> Option<String> {
+            self.labels.get(&node_id).cloned()
+        }
+    }
+
+    #[test]
+    fn labels_round_trip_via_build_then_label_of() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let mut labels: std::collections::BTreeMap<_, _> = std::collections::BTreeMap::new();
+        labels.insert(nodes[0].id, "alpha".to_string());
+        labels.insert(nodes[3].id, "delta".to_string());
+        let src = LabeledSliceSource::new(&nodes, &edges, labels);
+        idx.build_from_source(&src).unwrap();
+
+        assert_eq!(idx.label_of(nodes[0].id).unwrap().as_deref(), Some("alpha"));
+        assert_eq!(idx.label_of(nodes[3].id).unwrap().as_deref(), Some("delta"));
+        // Nodes without labels return None — not an error.
+        assert!(idx.label_of(nodes[1].id).unwrap().is_none());
+    }
+
+    #[test]
+    fn uuid_of_label_reverse_lookup() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let mut labels: std::collections::BTreeMap<_, _> = std::collections::BTreeMap::new();
+        labels.insert(nodes[0].id, "alpha".to_string());
+        let src = LabeledSliceSource::new(&nodes, &edges, labels);
+        idx.build_from_source(&src).unwrap();
+
+        assert_eq!(idx.uuid_of_label("alpha").unwrap(), Some(nodes[0].id));
+        assert!(idx.uuid_of_label("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn labels_survive_close_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let mut labels: std::collections::BTreeMap<_, _> = std::collections::BTreeMap::new();
+        labels.insert(nodes[0].id, "alpha".to_string());
+        labels.insert(nodes[3].id, "delta".to_string());
+
+        {
+            let mut idx = SwIndex::open(dir.path()).unwrap();
+            let src = LabeledSliceSource::new(&nodes, &edges, labels);
+            idx.build_from_source(&src).unwrap();
+        }
+
+        let reopened = SwIndex::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.label_of(nodes[0].id).unwrap().as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(reopened.uuid_of_label("delta").unwrap(), Some(nodes[3].id));
+    }
+
+    #[test]
+    fn query_by_label_returns_labels_in_priority_order() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        // Label all 6 nodes with their index for clarity.
+        let mut labels: std::collections::BTreeMap<_, _> = std::collections::BTreeMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            labels.insert(n.id, format!("node_{i}"));
+        }
+        let src = LabeledSliceSource::new(&nodes, &edges, labels);
+        idx.build_from_source(&src).unwrap();
+
+        // SameCluster on node_0 should return labels of nodes 0, 1, 2
+        // (the first triangle's cluster) as a set.
+        let result = idx
+            .query_by_label(QueryKindByLabel::SameCluster {
+                start: "node_0".into(),
+            })
+            .unwrap();
+        let got: std::collections::BTreeSet<&str> =
+            result.labels.iter().map(String::as_str).collect();
+        let want: std::collections::BTreeSet<&str> =
+            ["node_0", "node_1", "node_2"].into_iter().collect();
+        assert_eq!(got, want);
+        assert_eq!(result.stats.clusters_visited, 1);
+    }
+
+    #[test]
+    fn query_by_label_with_unknown_seed_returns_empty_result() {
+        // Contract: the unknown-seed case is NOT an error, just an
+        // empty result. Callers do "tell me what's like X" where X
+        // may not exist; an error there is the wrong ergonomics.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let result = idx
+            .query_by_label(QueryKindByLabel::Similar {
+                start: "nonexistent_table".into(),
+                limit: 10,
+            })
+            .unwrap();
+        assert!(result.labels.is_empty());
+        assert_eq!(result.stats.clusters_visited, 0);
+    }
+
+    #[test]
+    fn query_by_label_falls_back_to_uuid_string_for_unlabeled_results() {
+        // Build with PARTIAL labels: seed has a label, but some
+        // cluster peers don't. query_by_label must still produce
+        // printable strings — fall back to uuid hex for the
+        // unlabeled ones.
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let mut labels: std::collections::BTreeMap<_, _> = std::collections::BTreeMap::new();
+        labels.insert(nodes[0].id, "seed".to_string());
+        // Deliberately leave nodes[1] and nodes[2] unlabeled.
+        let src = LabeledSliceSource::new(&nodes, &edges, labels);
+        idx.build_from_source(&src).unwrap();
+
+        let result = idx
+            .query_by_label(QueryKindByLabel::SameCluster {
+                start: "seed".into(),
+            })
+            .unwrap();
+        // Three labels returned (cluster size 3); one is "seed",
+        // the other two should be uuid hex strings.
+        assert_eq!(result.labels.len(), 3);
+        let has_seed = result.labels.iter().any(|l| l == "seed");
+        assert!(has_seed);
+        let has_uuid_fallback = result.labels.iter().any(|l| l != "seed" && l.contains('-'));
+        assert!(
+            has_uuid_fallback,
+            "expected at least one fallback uuid string, got {:?}",
+            result.labels
+        );
     }
 
     #[test]

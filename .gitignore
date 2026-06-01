@@ -14,3 +14,11 @@ gemini_revew.md
 gemini_review.md
 *_review_draft.md
 review_*.md
+
+# User MySQL schemas — NEVER commit. The whole tree is blocked at any
+# depth; if we ever want to commit a *public sample* fixture (sakila etc.)
+# we add an explicit `!path/to/fixture.sql` un-ignore for that file.
+*.sql
+*.sql.gz
+schema.sql
+**/schema/*.sql

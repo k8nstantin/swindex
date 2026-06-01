@@ -57,6 +57,7 @@ pub mod node;
 pub mod quality;
 pub mod region;
 pub mod source;
+pub mod sql_dump;
 
 pub use community::{
     Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity, regions_from_clusters,
@@ -75,6 +76,7 @@ pub use node::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 pub use quality::nmi;
 pub use region::RegionGraph;
 pub use source::{GraphSource, SliceSource};
+pub use sql_dump::{SqlDumpError, SqlDumpSource};
 
 /// Returns the crate version as declared in `Cargo.toml`.
 ///

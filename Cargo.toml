@@ -28,6 +28,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "quickstart"
 path = "examples/quickstart.rs"
 
+# Schema inspector for ad-hoc validation against a real mysqldump
+# output. Takes a path argument; never reads from the repo by default.
+[[example]]
+name = "schema_inspect"
+path = "examples/schema_inspect.rs"
+
 [[bench]]
 name = "scaling"
 harness = false

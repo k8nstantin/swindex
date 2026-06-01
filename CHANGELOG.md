@@ -12,10 +12,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `BENCHMARKS.md` updated with the actual measured numbers from the v0.1.0 bench run and the correct SBM-parameter calibration.
 - GitHub repo description and homepage URL.
 - **`tracing` instrumentation on `SwIndex`** (review #44 §7.7). `open`, `build_from_source`, and `query` now emit `info`-level spans; `build_from_source` emits a debug-level sub-span per pipeline phase (`graph`, `leiden`, `regions`, `hubs`, `hub_graph`, `persist`) with structured fields (graph size, cluster count, hub count, query stats). No subscriber wired up; caller's choice. See the module-level doc for a quickstart with `tracing-subscriber`.
+- **Format version byte on all variable-length `SwIndex` encodings** (issue #49, review #44 §3.3). `cluster_members`, `hub_neighbors`, and `cluster_meta` payloads now start with `FORMAT_V1 = 0x01`. Decoders refuse any other byte with the new `SwIndexError::UnsupportedFormat { found, context }` variant — distinct from `Corruption` so operator messaging can route upgrade-prompts separately from data-integrity alerts. Fixed-width partitions (`uuid_to_cluster`, `uuid_to_region`, `uuid_is_hub`) deliberately do **not** carry a version byte; they're trivially evolvable by widening the value type and re-detecting at open time. 4 new tests cover round-trip + future-version rejection + empty-payload rejection.
 
 ### Changed
 - `deployment_plan.md` (repo root) → `docs/HISTORY.md` — the bootstrap is done; the file was stale and contradicted what was actually built.
 - `BENCHMARKS.md` methodology section corrected: documents the **sparse** SBM (`p_in = target_avg_degree / (cluster_size − 1)`) actually used by `benches/scaling.rs`, not the unused dense parameters.
+- **`SwIndex` on-disk format is now v1.** Indexes built with v0.1.0 (no format-version byte) can no longer be read by the current `decode_*` paths — they'll fail with `Corruption(...)` because the leading byte is interpreted as a version byte and won't be `0x01` in the general case. v0.1.0 is pre-release; no migration code is provided. Rebuild from source.
 
 ### Dependencies
 - Added `tracing = "0.1"` (production dep).
@@ -45,7 +47,7 @@ First working release. All four architecture layers shipped + persistence + stru
 - Time-travel queries not implemented ([#29](https://github.com/k8nstantin/swindex/issues/29)).
 - Bench sweep stops at N=50k; the design's full sweep to 10⁷ is deferred to a long-run bench group ([#28](https://github.com/k8nstantin/swindex/issues/28) tracking; also #41 for LFR, #42 for SNAP).
 - Region routing is structurally present (cluster→region mapping) but not yet wired into the query planner — see review notes #44 §3.1.
-- Binary persistence format has no version byte — see review notes #44 §3.3.
+- ~~Binary persistence format has no version byte — see review notes #44 §3.3.~~ **Fixed in Unreleased; format is now v1.**
 
 [Unreleased]: https://github.com/k8nstantin/swindex/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/k8nstantin/swindex/releases/tag/v0.1.0

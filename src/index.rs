@@ -87,6 +87,17 @@ const DEFAULT_HUB_FRACTION: f64 = 0.10;
 // Hub-graph k_hop default. Per `DESIGN.md` line 102.
 const DEFAULT_HUB_GRAPH_K_HOP: usize = 3;
 
+/// Version byte prepended to every variable-length value written by
+/// this build. Encoders write it; decoders refuse anything else. Bump
+/// when the binary layout of `cluster_members`, `hub_neighbors`, or
+/// `cluster_meta` changes — and remember to keep `read_format_byte`
+/// in sync (or fan it out into version-specific decoders).
+///
+/// Fixed-width values (`uuid_to_cluster`, `uuid_to_region`,
+/// `uuid_is_hub`) deliberately have no version byte: they're trivially
+/// evolvable by widening the value type and re-detecting at open time.
+const FORMAT_V1: u8 = 0x01;
+
 /// The persisted small-world property-graph index.
 ///
 /// `SwIndex` wraps a Fjall keyspace plus six partitions. Open one at a
@@ -117,11 +128,23 @@ pub enum SwIndexError {
     /// Error building the in-memory graph from the source (dangling
     /// edge, malformed input).
     Graph(GraphError),
-    /// On-disk data is shaped differently than expected. Either a
-    /// corrupted keyspace or a version mismatch from a future swindex
-    /// release that wrote a different format. The string carries
-    /// detail for the operator.
+    /// On-disk data is shaped differently than expected — a corrupted
+    /// keyspace, truncated value, or otherwise malformed payload. The
+    /// string carries detail for the operator. For version-mismatch
+    /// specifically see [`SwIndexError::UnsupportedFormat`].
     Corruption(String),
+    /// A persisted value carries a format-version byte this build does
+    /// not know how to decode. Written by a newer swindex release into
+    /// a partition this older build is now trying to read. Distinct
+    /// from [`SwIndexError::Corruption`] so callers can route
+    /// upgrade-prompts separately from data-integrity alerts.
+    UnsupportedFormat {
+        /// The version byte we found at the head of the payload.
+        found: u8,
+        /// The partition / encoding we were trying to decode, for
+        /// operator-facing detail.
+        context: &'static str,
+    },
 }
 
 impl fmt::Display for SwIndexError {
@@ -131,6 +154,14 @@ impl fmt::Display for SwIndexError {
             SwIndexError::Fjall(e) => write!(f, "swindex fjall error: {e}"),
             SwIndexError::Graph(e) => write!(f, "swindex graph error: {e}"),
             SwIndexError::Corruption(s) => write!(f, "swindex on-disk corruption: {s}"),
+            SwIndexError::UnsupportedFormat { found, context } => {
+                let known = FORMAT_V1;
+                write!(
+                    f,
+                    "swindex unsupported format: {context} carries version byte 0x{found:02x}, \
+                     this build only knows 0x{known:02x}. Upgrade swindex or rebuild the index."
+                )
+            }
         }
     }
 }
@@ -141,7 +172,7 @@ impl std::error::Error for SwIndexError {
             SwIndexError::Io(e) => Some(e),
             SwIndexError::Fjall(e) => Some(e),
             SwIndexError::Graph(e) => Some(e),
-            SwIndexError::Corruption(_) => None,
+            SwIndexError::Corruption(_) | SwIndexError::UnsupportedFormat { .. } => None,
         }
     }
 }
@@ -419,13 +450,10 @@ impl SwIndex {
                 .map_err(|_| SwIndexError::Corruption("cluster size exceeds u32".into()))?;
             let hub_count_u32 = u32::try_from(hub_count_usize)
                 .map_err(|_| SwIndexError::Corruption("hub count exceeds u32".into()))?;
-            let mut meta_buf = Vec::with_capacity(8);
-            meta_buf.extend_from_slice(&size_u32.to_le_bytes());
-            meta_buf.extend_from_slice(&hub_count_u32.to_le_bytes());
             batch.insert(
                 &self.cluster_meta,
                 cluster_id.to_le_bytes().as_slice(),
-                meta_buf,
+                encode_cluster_meta(size_u32, hub_count_u32),
             );
         }
 
@@ -706,23 +734,7 @@ impl SwIndex {
     pub fn cluster_meta(&self, cluster_id: u32) -> Result<Option<(u32, u32)>, SwIndexError> {
         let key = cluster_id.to_le_bytes();
         let raw = self.cluster_meta.get(key.as_slice())?;
-        raw.map(|b| {
-            if b.len() != 8 {
-                return Err(SwIndexError::Corruption(format!(
-                    "cluster_meta expected 8 bytes, got {}",
-                    b.len()
-                )));
-            }
-            let mut size_bytes = [0u8; 4];
-            size_bytes.copy_from_slice(&b[0..4]);
-            let mut hub_bytes = [0u8; 4];
-            hub_bytes.copy_from_slice(&b[4..8]);
-            Ok((
-                u32::from_le_bytes(size_bytes),
-                u32::from_le_bytes(hub_bytes),
-            ))
-        })
-        .transpose()
+        raw.map(|b| decode_cluster_meta(&b)).transpose()
     }
 }
 
@@ -741,11 +753,32 @@ impl fmt::Debug for SwIndex {
 // Encoding helpers
 // =========================================================================
 
+/// Strip the leading format-version byte from a payload and return the
+/// remainder. Rejects unknown versions with
+/// [`SwIndexError::UnsupportedFormat`]. Centralizing this check means
+/// the three decoders below stay focused on their own layout and we
+/// only have one place to teach about a future v2.
+fn read_format_byte<'a>(bytes: &'a [u8], context: &'static str) -> Result<&'a [u8], SwIndexError> {
+    let Some((&version, rest)) = bytes.split_first() else {
+        return Err(SwIndexError::Corruption(format!(
+            "{context}: payload is empty (expected at least 1 byte for format version)"
+        )));
+    };
+    if version != FORMAT_V1 {
+        return Err(SwIndexError::UnsupportedFormat {
+            found: version,
+            context,
+        });
+    }
+    Ok(rest)
+}
+
 fn encode_uuid_vec(uuids: &[Uuid7]) -> Result<Vec<u8>, SwIndexError> {
-    // 4-byte length prefix (u32 LE) + 16 B per uuid.
+    // 1-byte format version + 4-byte length prefix (u32 LE) + 16 B per uuid.
     let len = u32::try_from(uuids.len())
         .map_err(|_| SwIndexError::Corruption("vec len exceeds u32".into()))?;
-    let mut buf = Vec::with_capacity(4 + uuids.len() * 16);
+    let mut buf = Vec::with_capacity(1 + 4 + uuids.len() * 16);
+    buf.push(FORMAT_V1);
     buf.extend_from_slice(&len.to_le_bytes());
     for u in uuids {
         buf.extend_from_slice(u.as_bytes());
@@ -753,20 +786,21 @@ fn encode_uuid_vec(uuids: &[Uuid7]) -> Result<Vec<u8>, SwIndexError> {
     Ok(buf)
 }
 
-fn decode_uuid_vec(bytes: &[u8], context: &str) -> Result<Vec<Uuid7>, SwIndexError> {
-    if bytes.len() < 4 {
+fn decode_uuid_vec(bytes: &[u8], context: &'static str) -> Result<Vec<Uuid7>, SwIndexError> {
+    let body = read_format_byte(bytes, context)?;
+    if body.len() < 4 {
         return Err(SwIndexError::Corruption(format!(
-            "{context}: payload < 4 bytes"
+            "{context}: payload body < 4 bytes after version byte"
         )));
     }
     let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&bytes[0..4]);
+    len_bytes.copy_from_slice(&body[0..4]);
     let len = u32::from_le_bytes(len_bytes) as usize;
     let expected = 4 + len * 16;
-    if bytes.len() != expected {
+    if body.len() != expected {
         return Err(SwIndexError::Corruption(format!(
-            "{context}: expected {expected} bytes for len={len}, got {}",
-            bytes.len()
+            "{context}: expected {expected} body bytes for len={len}, got {}",
+            body.len()
         )));
     }
     let mut out = Vec::with_capacity(len);
@@ -774,11 +808,11 @@ fn decode_uuid_vec(bytes: &[u8], context: &str) -> Result<Vec<Uuid7>, SwIndexErr
         let start = 4 + i * 16;
         let end = start + 16;
         let mut buf = [0u8; 16];
-        buf.copy_from_slice(&bytes[start..end]);
+        buf.copy_from_slice(&body[start..end]);
         let raw = Uuid::from_bytes(buf);
         let wrapped = Uuid7::from_uuid(raw).ok_or_else(|| {
             SwIndexError::Corruption(format!(
-                "{context}: stored UUID at offset {start} is not version 7"
+                "{context}: stored UUID at body offset {start} is not version 7"
             ))
         })?;
         out.push(wrapped);
@@ -787,10 +821,11 @@ fn decode_uuid_vec(bytes: &[u8], context: &str) -> Result<Vec<Uuid7>, SwIndexErr
 }
 
 fn encode_hub_neighbors(items: &[(Uuid7, f32)]) -> Result<Vec<u8>, SwIndexError> {
-    // 4-byte length prefix (u32 LE) + 20 B per item (16 B uuid + 4 B f32).
+    // 1-byte format version + 4-byte length prefix + 20 B per item.
     let len = u32::try_from(items.len())
         .map_err(|_| SwIndexError::Corruption("hub-neighbors len exceeds u32".into()))?;
-    let mut buf = Vec::with_capacity(4 + items.len() * 20);
+    let mut buf = Vec::with_capacity(1 + 4 + items.len() * 20);
+    buf.push(FORMAT_V1);
     buf.extend_from_slice(&len.to_le_bytes());
     for (uuid, w) in items {
         buf.extend_from_slice(uuid.as_bytes());
@@ -799,38 +834,69 @@ fn encode_hub_neighbors(items: &[(Uuid7, f32)]) -> Result<Vec<u8>, SwIndexError>
     Ok(buf)
 }
 
-fn decode_hub_neighbors(bytes: &[u8], context: &str) -> Result<Vec<(Uuid7, f32)>, SwIndexError> {
-    if bytes.len() < 4 {
+fn decode_hub_neighbors(
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<Vec<(Uuid7, f32)>, SwIndexError> {
+    let body = read_format_byte(bytes, context)?;
+    if body.len() < 4 {
         return Err(SwIndexError::Corruption(format!(
-            "{context}: payload < 4 bytes"
+            "{context}: payload body < 4 bytes after version byte"
         )));
     }
     let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&bytes[0..4]);
+    len_bytes.copy_from_slice(&body[0..4]);
     let len = u32::from_le_bytes(len_bytes) as usize;
     let expected = 4 + len * 20;
-    if bytes.len() != expected {
+    if body.len() != expected {
         return Err(SwIndexError::Corruption(format!(
-            "{context}: expected {expected} bytes for len={len}, got {}",
-            bytes.len()
+            "{context}: expected {expected} body bytes for len={len}, got {}",
+            body.len()
         )));
     }
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
         let base = 4 + i * 20;
         let mut uuid_buf = [0u8; 16];
-        uuid_buf.copy_from_slice(&bytes[base..base + 16]);
+        uuid_buf.copy_from_slice(&body[base..base + 16]);
         let raw = Uuid::from_bytes(uuid_buf);
         let wrapped = Uuid7::from_uuid(raw).ok_or_else(|| {
             SwIndexError::Corruption(format!(
-                "{context}: stored hub neighbor at offset {base} is not v7"
+                "{context}: stored hub neighbor at body offset {base} is not v7"
             ))
         })?;
         let mut w_buf = [0u8; 4];
-        w_buf.copy_from_slice(&bytes[base + 16..base + 20]);
+        w_buf.copy_from_slice(&body[base + 16..base + 20]);
         out.push((wrapped, f32::from_le_bytes(w_buf)));
     }
     Ok(out)
+}
+
+fn encode_cluster_meta(size: u32, hub_count: u32) -> Vec<u8> {
+    // 1-byte format version + 4-byte size LE + 4-byte hub_count LE = 9 B.
+    let mut buf = Vec::with_capacity(9);
+    buf.push(FORMAT_V1);
+    buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&hub_count.to_le_bytes());
+    buf
+}
+
+fn decode_cluster_meta(bytes: &[u8]) -> Result<(u32, u32), SwIndexError> {
+    let body = read_format_byte(bytes, "cluster_meta")?;
+    if body.len() != 8 {
+        return Err(SwIndexError::Corruption(format!(
+            "cluster_meta expected 8 body bytes after version, got {}",
+            body.len()
+        )));
+    }
+    let mut size_bytes = [0u8; 4];
+    size_bytes.copy_from_slice(&body[0..4]);
+    let mut hub_bytes = [0u8; 4];
+    hub_bytes.copy_from_slice(&body[4..8]);
+    Ok((
+        u32::from_le_bytes(size_bytes),
+        u32::from_le_bytes(hub_bytes),
+    ))
 }
 
 fn decode_u32(bytes: &[u8], context: &str) -> Result<u32, SwIndexError> {
@@ -847,7 +913,12 @@ fn decode_u32(bytes: &[u8], context: &str) -> Result<u32, SwIndexError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildStats, QueryKind, SwIndex};
+    use super::{
+        BuildStats, FORMAT_V1, QueryKind, SwIndex, SwIndexError, decode_cluster_meta,
+        decode_hub_neighbors, decode_uuid_vec, encode_cluster_meta, encode_hub_neighbors,
+        encode_uuid_vec,
+    };
+    use crate::id::Uuid7;
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
     use crate::source::{GraphSource, SliceSource};
     use tempfile::TempDir;
@@ -1206,5 +1277,110 @@ mod tests {
         assert!(result.uuids.len() <= 33);
         let uniq: std::collections::BTreeSet<_> = result.uuids.iter().copied().collect();
         assert_eq!(uniq.len(), result.uuids.len(), "result has duplicates");
+    }
+
+    // =====================================================================
+    // Format-version-byte tests (issue #49)
+    //
+    // These tests pin the contract that all variable-length encodings
+    // begin with `FORMAT_V1` and that decoders refuse anything else with
+    // `SwIndexError::UnsupportedFormat` (rather than silently misreading
+    // a future format as corrupted data — that distinction matters for
+    // operator messaging).
+    // =====================================================================
+
+    #[test]
+    fn format_version_byte_is_first_in_every_variable_payload() {
+        // Encoders are the single source of truth for the on-disk shape.
+        // If a future change forgets the version byte, this test fires
+        // before round-trip tests do.
+        let uuids = vec![Uuid7::now(), Uuid7::now()];
+        let buf = encode_uuid_vec(&uuids).unwrap();
+        assert_eq!(buf.first(), Some(&FORMAT_V1), "uuid_vec missing version");
+
+        let neighbors = vec![(Uuid7::now(), 0.5_f32)];
+        let buf = encode_hub_neighbors(&neighbors).unwrap();
+        assert_eq!(
+            buf.first(),
+            Some(&FORMAT_V1),
+            "hub_neighbors missing version"
+        );
+
+        let buf = encode_cluster_meta(42, 7);
+        assert_eq!(
+            buf.first(),
+            Some(&FORMAT_V1),
+            "cluster_meta missing version"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_future_version_with_unsupported_format() {
+        // Hand-craft a buffer with a *future* version byte (V1 + 1) and
+        // confirm the decoder refuses it instead of returning garbage.
+        // This is the load-bearing forward-compat test from issue #49 §4.
+        let mut buf = encode_uuid_vec(&[Uuid7::now()]).unwrap();
+        buf[0] = FORMAT_V1 + 1;
+        match decode_uuid_vec(&buf, "cluster_members") {
+            Err(SwIndexError::UnsupportedFormat { found, context }) => {
+                assert_eq!(found, FORMAT_V1 + 1);
+                assert_eq!(context, "cluster_members");
+            }
+            other => panic!("expected UnsupportedFormat, got {other:?}"),
+        }
+
+        let mut buf = encode_hub_neighbors(&[(Uuid7::now(), 1.0)]).unwrap();
+        buf[0] = 0xFF;
+        match decode_hub_neighbors(&buf, "hub_neighbors") {
+            Err(SwIndexError::UnsupportedFormat { found, context }) => {
+                assert_eq!(found, 0xFF);
+                assert_eq!(context, "hub_neighbors");
+            }
+            other => panic!("expected UnsupportedFormat, got {other:?}"),
+        }
+
+        let mut buf = encode_cluster_meta(1, 0);
+        buf[0] = 0x00;
+        match decode_cluster_meta(&buf) {
+            Err(SwIndexError::UnsupportedFormat { found, context }) => {
+                assert_eq!(found, 0x00);
+                assert_eq!(context, "cluster_meta");
+            }
+            other => panic!("expected UnsupportedFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_empty_payload_as_corruption() {
+        // Empty payload is corruption (not a version mismatch). We don't
+        // want to conflate the two — operators read these errors and
+        // decide whether to upgrade swindex (UnsupportedFormat) or
+        // rebuild from source (Corruption).
+        match decode_uuid_vec(&[], "cluster_members") {
+            Err(SwIndexError::Corruption(_)) => {}
+            other => panic!("expected Corruption for empty payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_each_variable_encoder() {
+        // Pure encoding round-trips, isolated from Fjall, so a regression
+        // in the byte layout shows up here before the persistence tests.
+        let uuids = vec![Uuid7::now(), Uuid7::now(), Uuid7::now()];
+        let buf = encode_uuid_vec(&uuids).unwrap();
+        let decoded = decode_uuid_vec(&buf, "cluster_members").unwrap();
+        assert_eq!(decoded, uuids);
+
+        let neighbors = vec![(Uuid7::now(), 0.25_f32), (Uuid7::now(), 0.5_f32)];
+        let buf = encode_hub_neighbors(&neighbors).unwrap();
+        let decoded = decode_hub_neighbors(&buf, "hub_neighbors").unwrap();
+        assert_eq!(decoded.len(), neighbors.len());
+        for (got, want) in decoded.iter().zip(neighbors.iter()) {
+            assert_eq!(got.0, want.0);
+            assert!((got.1 - want.1).abs() < f32::EPSILON);
+        }
+
+        let buf = encode_cluster_meta(123, 4);
+        assert_eq!(decode_cluster_meta(&buf).unwrap(), (123, 4));
     }
 }

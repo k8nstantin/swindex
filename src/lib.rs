@@ -31,8 +31,13 @@
 //! * [`community`] — [`community::Partition`], [`community::modularity`],
 //!   Louvain and Leiden community detection. Produces Q ≈ 0.42 on
 //!   Zachary karate with provably-connected communities.
-//! * [`hub`] — [`hub::HubSet`], degree-based hub identification. The
-//!   Layer-2 hub set that the query planner routes through.
+//! * [`hub`] — [`hub::HubSet`], hub identification. Degree-based
+//!   ([`hub::HubSet::from_top_fraction`]) plus betweenness-based
+//!   ([`hub::HubSet::from_centrality`]). The Layer-2 hub set that the
+//!   query planner routes through.
+//! * [`betweenness`] — [`betweenness::approximate_betweenness`], Brandes'
+//!   algorithm with sampled sources. Finds bridge nodes that degree
+//!   detection misses.
 //! * [`hub_graph`] — [`hub_graph::HubGraph`], the Layer-2 adjacency
 //!   structure derived from a `Graph` plus a `HubSet`. Built by BFS
 //!   up to a `k_hop` ball; edge weights = `1 / hop_distance`.
@@ -45,6 +50,7 @@
 //!   pipeline and commits atomically; close + reopen round-trips
 //!   identical answers.
 
+pub mod betweenness;
 pub mod community;
 pub mod gml;
 pub mod graph;
@@ -59,6 +65,7 @@ pub mod region;
 pub mod source;
 pub mod sql_dump;
 
+pub use betweenness::approximate_betweenness;
 pub use community::{
     Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity, regions_from_clusters,
 };

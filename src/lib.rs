@@ -57,6 +57,7 @@
 
 pub mod betweenness;
 pub mod community;
+pub mod corridor;
 pub mod gml;
 pub mod graph;
 pub mod hub;
@@ -75,6 +76,7 @@ pub use community::{
     Partition, cluster_adjacency, leiden, leiden_seeded, louvain, louvain_seeded, modularity,
     regions_from_clusters,
 };
+pub use corridor::{CorridorReport, bfs_distance, cluster_corridor, evaluate_corridor};
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
 pub use hub::HubSet;

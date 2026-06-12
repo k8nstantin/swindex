@@ -122,3 +122,38 @@ pub fn generate_sbm(n_nodes: usize, k: usize, p_in: f64, p_out: f64, seed: u64) 
         planted: Partition::new(cluster_of),
     }
 }
+
+// ===========================================================================
+// Cross-cluster pair sampling — shared by the corridor experiment
+// (issue #71) and the Gate-1 navigation experiment (issue #72).
+// ===========================================================================
+
+/// Sample up to `k` distinct `(from, to)` node-index pairs whose
+/// endpoints lie in different communities of `partition`, driven by
+/// the seeded xorshift so every run draws the same pairs. Attempts
+/// are bounded (`k * 200`) so a pathological partition (e.g. one
+/// giant community) returns fewer pairs instead of looping forever.
+#[allow(clippy::cast_possible_truncation)] // u64 -> usize mod n_nodes, same as the SBM generator
+pub fn sample_cross_cluster_pairs(
+    n_nodes: usize,
+    partition: &Partition,
+    k: usize,
+    seed: u64,
+) -> Vec<(usize, usize)> {
+    let mut state = if seed == 0 { 1 } else { seed };
+    let mut drawn = std::collections::BTreeSet::new();
+    let mut pairs = Vec::with_capacity(k);
+    let mut attempts = 0_usize;
+    while pairs.len() < k && attempts < k.saturating_mul(200) {
+        attempts += 1;
+        let from = (xorshift64(&mut state) as usize) % n_nodes;
+        let to = (xorshift64(&mut state) as usize) % n_nodes;
+        if from == to || partition.community_of(from) == partition.community_of(to) {
+            continue;
+        }
+        if drawn.insert((from, to)) {
+            pairs.push((from, to));
+        }
+    }
+    pairs
+}

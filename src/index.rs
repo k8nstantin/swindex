@@ -569,7 +569,13 @@ impl SwIndex {
         for (cluster_id_usize, members) in clusters.buckets().iter().enumerate() {
             let cluster_id = u32::try_from(cluster_id_usize)
                 .map_err(|_| SwIndexError::Corruption("cluster id exceeds u32 range".into()))?;
-            let member_uuids: Vec<Uuid7> = members.iter().map(|&u| graph.node_id(u)).collect();
+            let mut member_uuids: Vec<Uuid7> = members.iter().map(|&u| graph.node_id(u)).collect();
+            // Sorted ascending so `insert_node`'s binary_search-based
+            // positional insert sees the invariant it assumes. Bucket
+            // order (node-index order) is NOT uuid order in general —
+            // Uuid7s minted in the same millisecond have no monotonic
+            // guarantee (issue #66).
+            member_uuids.sort_unstable();
             let members_buf = encode_uuid_vec(&member_uuids)?;
             batch.insert(
                 &self.cluster_members,
@@ -1112,6 +1118,20 @@ impl SwIndex {
             info_span!("swindex.insert_node", uuid = ?node.id, seeds = seed_neighbors.len())
                 .entered();
 
+        // Step 0: contract check — the uuid must not already exist
+        // ANYWHERE in the index. `uuid_to_cluster` is the
+        // authoritative membership map and covers every cluster;
+        // checking only the assigned cluster's member list (the
+        // previous guard) missed duplicates living in *other*
+        // clusters, which re-pointed `uuid_to_cluster` while leaving
+        // the uuid in the old cluster's member list (issue #66).
+        if let Some(existing) = self.cluster_of(node.id)? {
+            return Err(SwIndexError::Corruption(format!(
+                "insert_node: uuid {} already exists in the index (cluster {existing})",
+                node.id.as_uuid()
+            )));
+        }
+
         // Step 1: tally votes from known seed neighbors. BTreeMap so
         // iteration order is deterministic for tie-breaking.
         let mut votes: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1168,18 +1188,19 @@ impl SwIndex {
         // member list is small relative to the full index so the
         // re-encode cost is bounded by cluster size, not graph size.
         let mut members = self.cluster_members(assigned)?.unwrap_or_default();
-        // Maintain sorted order — `build_from_source` produces members
-        // in cluster-internal order; `insert_node` is the new write
-        // path and sorting keeps `cluster_members(c)` output stable
-        // across rebuild vs. insert.
+        // Maintain sorted order — `build_from_source` writes each
+        // cluster's members sorted ascending (issue #66), and the
+        // positional insert below preserves that, so binary_search's
+        // precondition holds on both write paths.
         let new_uuid = node.id;
         match members.binary_search(&new_uuid) {
             Ok(_) => {
-                // Already present — `insert_node` on an existing uuid
-                // is a contract violation. Bail without mutating
-                // anything.
+                // Step 0 said the uuid is absent from uuid_to_cluster,
+                // yet it sits in this cluster's member list — the two
+                // partitions disagree, which is genuine corruption.
                 return Err(SwIndexError::Corruption(format!(
-                    "insert_node: uuid {} already exists in the index",
+                    "insert_node: uuid {} absent from uuid_to_cluster but present in cluster \
+                     {assigned}'s member list",
                     new_uuid.as_uuid()
                 )));
             }
@@ -2106,6 +2127,111 @@ mod tests {
                 "expected duplicate-uuid corruption, got {msg}"
             ),
             other => panic!("expected Corruption, got {other:?}"),
+        }
+    }
+
+    /// Issue #66: the old guard only searched the *assigned* cluster's
+    /// member list, so re-inserting a uuid with seeds that vote for a
+    /// DIFFERENT cluster slipped past it — re-pointing uuid_to_cluster
+    /// while the uuid stayed in the old cluster's member list. The
+    /// rejection must fire on cross-cluster duplicates and leave every
+    /// partition untouched.
+    #[test]
+    fn insert_node_rejects_duplicate_uuid_across_clusters() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let home = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let other = idx.cluster_of(nodes[3].id).unwrap().unwrap();
+        assert_ne!(home, other);
+        let members_home_before = idx.cluster_members(home).unwrap().unwrap();
+        let members_other_before = idx.cluster_members(other).unwrap().unwrap();
+        let meta_other_before = idx.cluster_meta(other).unwrap().unwrap();
+        let drift_other_before = idx.cluster_drift(other).unwrap();
+
+        // Re-insert nodes[0] with seeds entirely from the OTHER
+        // triangle — majority vote would assign the other cluster.
+        let dup = crate::node::Node {
+            id: nodes[0].id,
+            kind: NodeKind::new("v"),
+        };
+        let err = idx
+            .insert_node(&dup, &[nodes[3].id, nodes[4].id])
+            .unwrap_err();
+        assert!(
+            matches!(&err, SwIndexError::Corruption(msg) if msg.contains("already exists")),
+            "expected cross-cluster duplicate rejection, got {err:?}"
+        );
+
+        // Nothing moved: assignment, both member lists, meta, drift.
+        assert_eq!(idx.cluster_of(nodes[0].id).unwrap(), Some(home));
+        assert_eq!(
+            idx.cluster_members(home).unwrap().unwrap(),
+            members_home_before
+        );
+        assert_eq!(
+            idx.cluster_members(other).unwrap().unwrap(),
+            members_other_before
+        );
+        assert_eq!(idx.cluster_meta(other).unwrap().unwrap(), meta_other_before);
+        assert_eq!(idx.cluster_drift(other).unwrap(), drift_other_before);
+    }
+
+    /// Issue #66: re-inserting an existing uuid with NO known seeds
+    /// previously allocated a phantom singleton cluster and re-pointed
+    /// the uuid at it. The existence check must fire before cluster
+    /// allocation.
+    #[test]
+    fn insert_node_rejects_duplicate_uuid_with_unknown_seeds() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let build = idx.build_from_source(&src).unwrap();
+
+        let home = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let dup = crate::node::Node {
+            id: nodes[0].id,
+            kind: NodeKind::new("v"),
+        };
+        let err = idx.insert_node(&dup, &[]).unwrap_err();
+        assert!(
+            matches!(&err, SwIndexError::Corruption(msg) if msg.contains("already exists")),
+            "expected duplicate rejection on the singleton path, got {err:?}"
+        );
+        assert_eq!(idx.cluster_of(nodes[0].id).unwrap(), Some(home));
+        // No phantom singleton: cluster ids beyond the build's range
+        // must not exist.
+        let next_id = u32::try_from(build.clusters).unwrap();
+        assert!(idx.cluster_members(next_id).unwrap().is_none());
+    }
+
+    /// Issue #66: `build_from_source` must write each cluster's member
+    /// list sorted ascending — `insert_node`'s binary_search assumes
+    /// it. Bucket order is node-index order, so feeding the source's
+    /// nodes in reverse-mint order would previously persist a
+    /// descending (unsorted) list.
+    #[test]
+    fn build_writes_sorted_cluster_members_regardless_of_source_order() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (mut nodes, edges) = two_disjoint_triangles();
+        // Reverse the node slice: graph node-index order now runs
+        // opposite to uuid mint order (edges reference uuids, so the
+        // topology is unchanged).
+        nodes.reverse();
+        let src = SliceSource::new(&nodes, &edges);
+        let stats = idx.build_from_source(&src).unwrap();
+
+        for cluster_id in 0..u32::try_from(stats.clusters).unwrap() {
+            let members = idx.cluster_members(cluster_id).unwrap().unwrap();
+            assert!(
+                members.windows(2).all(|w| w[0] < w[1]),
+                "cluster {cluster_id} members not sorted ascending: {members:?}"
+            );
         }
     }
 

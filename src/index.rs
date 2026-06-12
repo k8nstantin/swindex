@@ -412,10 +412,15 @@ impl SwIndex {
     /// Fjall batch.
     ///
     /// **This rebuilds from scratch.** Calling `build_from_source` on a
-    /// keyspace that already contains data overwrites the existing
-    /// entries for every UUID present in the new source; UUIDs from
-    /// prior builds that aren't in the new source remain (they aren't
-    /// explicitly removed). For a clean rebuild, open a fresh path.
+    /// keyspace that already contains data atomically *replaces* it:
+    /// the same batch that writes the new build first stages a remove
+    /// of every existing key in all nine partitions, so entries from
+    /// prior builds — UUIDs, labels, hub adjacency, cluster
+    /// members/meta/drift — cannot survive a source that no longer
+    /// contains them (issue #64). Readers observe either the complete
+    /// old index or the complete new one, never a half-cleared state.
+    /// The clearing pass costs one key-scan of the existing index and
+    /// is a no-op on a fresh keyspace.
     ///
     /// # Errors
     ///
@@ -474,6 +479,30 @@ impl SwIndex {
         // Step 5: persist everything via one atomic Fjall batch.
         let _persist = debug_span!("swindex.build.persist").entered();
         let mut batch = self.keyspace.batch();
+
+        // A rebuild REPLACES the previous index. Stage a remove for
+        // every existing key in every partition before the inserts
+        // below — batch ops apply in commit order, so keys present in
+        // both builds simply end at their new values, while keys only
+        // in the prior build are gone. Without this, a shrinking
+        // source leaves zombie UUIDs/labels/clusters that queries
+        // would keep serving (issue #64).
+        for partition in [
+            &self.uuid_to_cluster,
+            &self.uuid_to_region,
+            &self.uuid_is_hub,
+            &self.hub_neighbors,
+            &self.cluster_members,
+            &self.cluster_meta,
+            &self.labels,
+            &self.label_to_uuid,
+            &self.cluster_drift,
+        ] {
+            for entry in partition.iter() {
+                let (key, _) = entry?;
+                batch.remove(partition, key);
+            }
+        }
 
         for u in 0..graph.node_count() {
             let uuid = graph.node_id(u);
@@ -1524,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn build_populates_all_six_partitions_and_returns_stats() {
+    fn build_populates_all_partitions_and_returns_stats() {
         let dir = TempDir::new().unwrap();
         let mut idx = SwIndex::open(dir.path()).unwrap();
         let (nodes, edges) = two_disjoint_triangles();
@@ -2237,6 +2266,126 @@ mod tests {
         assert_eq!(idx.label_of(nodes[3].id).unwrap().as_deref(), Some("delta"));
         // Nodes without labels return None — not an error.
         assert!(idx.label_of(nodes[1].id).unwrap().is_none());
+    }
+
+    /// Issue #64: rebuilding over a populated index must not leave
+    /// zombie entries. Build 1 indexes six nodes across two clusters
+    /// with two labels; build 2 indexes a disjoint three-node source.
+    /// If the clearing pass were removed, every assertion on build 1's
+    /// UUIDs, labels, and cluster ids below would fail — queries would
+    /// keep serving data the source no longer contains.
+    #[test]
+    fn rebuild_with_smaller_source_leaves_no_zombie_entries() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+
+        // Build 1: two triangles, a label on one node of each.
+        let (nodes_a, edges_a) = two_disjoint_triangles();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(nodes_a[0].id, "alpha".to_string());
+        labels.insert(nodes_a[3].id, "delta".to_string());
+        let src_a = LabeledSliceSource::new(&nodes_a, &edges_a, labels);
+        let stats_a = idx.build_from_source(&src_a).unwrap();
+        assert_eq!(stats_a.clusters, 2);
+
+        // Build 2: one fresh triangle — disjoint UUIDs, one cluster,
+        // no labels.
+        let mk = |k: &str| crate::node::Node::fresh(NodeKind::new(k));
+        let (x, y, z) = (mk("v"), mk("v"), mk("v"));
+        let edges_b = vec![
+            Edge::fresh(x.id, y.id, EdgeKind::new("e")),
+            Edge::fresh(y.id, z.id, EdgeKind::new("e")),
+            Edge::fresh(z.id, x.id, EdgeKind::new("e")),
+        ];
+        let nodes_b = vec![x, y, z];
+        let src_b = SliceSource::new(&nodes_b, &edges_b);
+        let stats_b = idx.build_from_source(&src_b).unwrap();
+        assert_eq!(stats_b.nodes, 3);
+        assert_eq!(stats_b.clusters, 1);
+
+        // Every UUID from build 1 is gone from every uuid-keyed
+        // partition.
+        for old in &nodes_a {
+            assert!(idx.cluster_of(old.id).unwrap().is_none());
+            assert!(idx.region_of(old.id).unwrap().is_none());
+            assert!(!idx.is_hub(old.id).unwrap());
+            assert!(idx.hub_neighbors(old.id).unwrap().is_empty());
+            assert!(idx.label_of(old.id).unwrap().is_none());
+        }
+        // Reverse label lookups are gone too.
+        assert!(idx.uuid_of_label("alpha").unwrap().is_none());
+        assert!(idx.uuid_of_label("delta").unwrap().is_none());
+
+        // Cluster-keyed partitions hold only build 2's single cluster
+        // (id 0); build 1's second cluster (id 1) no longer resolves.
+        assert!(idx.cluster_members(1).unwrap().is_none());
+        assert!(idx.cluster_meta(1).unwrap().is_none());
+        let drift = idx.drift_report().unwrap();
+        assert_eq!(drift.per_cluster.len(), 1);
+
+        // And the new build is fully served.
+        let c = idx.cluster_of(nodes_b[0].id).unwrap().unwrap();
+        let members = idx.cluster_members(c).unwrap().unwrap();
+        assert_eq!(members.len(), 3);
+    }
+
+    /// Issue #64: the clear-then-reinsert pass must be invisible when
+    /// the source hasn't changed — rebuilding with the same source
+    /// yields identical stats, assignments, and labels.
+    #[test]
+    fn rebuild_with_same_source_round_trips_identical_answers() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(nodes[0].id, "alpha".to_string());
+        let src = LabeledSliceSource::new(&nodes, &edges, labels);
+
+        let stats_1 = idx.build_from_source(&src).unwrap();
+        let assignments_1: Vec<_> = nodes
+            .iter()
+            .map(|n| idx.cluster_of(n.id).unwrap().unwrap())
+            .collect();
+
+        let stats_2 = idx.build_from_source(&src).unwrap();
+        let assignments_2: Vec<_> = nodes
+            .iter()
+            .map(|n| idx.cluster_of(n.id).unwrap().unwrap())
+            .collect();
+
+        assert_eq!(stats_1, stats_2);
+        assert_eq!(assignments_1, assignments_2);
+        assert_eq!(idx.label_of(nodes[0].id).unwrap().as_deref(), Some("alpha"));
+        assert_eq!(idx.uuid_of_label("alpha").unwrap(), Some(nodes[0].id));
+    }
+
+    /// Issue #64 acceptance: insert pressure recorded before a rebuild
+    /// must not survive it — drift bookkeeping restarts at zero.
+    #[test]
+    fn rebuild_resets_drift_counters() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        // Bump one cluster's delta_inserts via the incremental path.
+        let newcomer = crate::node::Node::fresh(NodeKind::new("v"));
+        let cluster = idx.insert_node(&newcomer, &[nodes[0].id]).unwrap();
+        assert_eq!(idx.cluster_drift(cluster).unwrap().1, 1);
+
+        idx.build_from_source(&src).unwrap();
+        let drift = idx.drift_report().unwrap();
+        assert!(
+            drift
+                .per_cluster
+                .values()
+                .all(|d| d.generation == 0 && d.delta_inserts == 0),
+            "drift must reset on rebuild, got {drift:?}"
+        );
+        // The incrementally-inserted node was not in the rebuild
+        // source, so it must be gone too.
+        assert!(idx.cluster_of(newcomer.id).unwrap().is_none());
     }
 
     #[test]

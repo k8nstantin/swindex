@@ -903,6 +903,34 @@ fn refine_partition(graph: &WeightedGraph, p: &Partition, seed: u64) -> Partitio
 ///
 /// Same `(graph, partition, seed)` always yields the same regions
 /// — Leiden's local-moving uses a seeded RNG.
+/// The weighted **cluster super-graph adjacency**: for each cluster
+/// `c`, the `(neighbor_cluster, weight)` pairs where weight is the
+/// total edge mass between the two clusters in the original graph.
+/// Self-loops (intra-cluster mass) are excluded — this is *adjacency*,
+/// not density. Neighbor lists come out sorted ascending by cluster id
+/// (BTreeMap accumulation) and the relation is symmetric:
+/// `weight(c→d) == weight(d→c)`.
+///
+/// This is the same aggregation [`regions_from_clusters`] performs
+/// internally before its Leiden pass (the modularity-preserving 2×
+/// doubling applies only to the self-loops excluded here), exposed so
+/// callers can persist or route on cluster adjacency without
+/// re-deriving it from Layer 0 (issue #70 — the Gate-0 substrate for
+/// corridor queries and the baseline arm of the Gate-1 experiment).
+/// It re-runs the `O(E)` aggregation rather than sharing the regions
+/// pass's copy; that cost is noise next to Leiden on the same graph.
+#[must_use]
+pub fn cluster_adjacency(graph: &Graph, partition: &Partition) -> Vec<Vec<(usize, f64)>> {
+    let k = partition.community_count();
+    if k == 0 {
+        return Vec::new();
+    }
+    let super_wg = WeightedGraph::from_graph(graph).aggregate(partition);
+    (0..k)
+        .map(|c| super_wg.neighbors(c).filter(|&(d, _)| d != c).collect())
+        .collect()
+}
+
 #[must_use]
 pub fn regions_from_clusters(graph: &Graph, partition: &Partition, seed: u64) -> Partition {
     let k = partition.community_count();
@@ -954,8 +982,8 @@ fn xorshift64(state: &mut u64) -> u64 {
 #[allow(clippy::float_cmp)] // Hand-computed expected values are exact.
 mod tests {
     use super::{
-        Partition, WeightedGraph, leiden, leiden_seeded, louvain, louvain_seeded, modularity,
-        refine_partition,
+        Partition, WeightedGraph, cluster_adjacency, leiden, leiden_seeded, louvain,
+        louvain_seeded, modularity, refine_partition,
     };
     use crate::graph::Graph;
     use crate::node::{Edge, EdgeKind, Node, NodeKind};
@@ -1253,5 +1281,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Hand-computed invariant for `cluster_adjacency` (issue #70):
+    /// two triangles joined by exactly one bridge edge, partitioned
+    /// one-triangle-per-cluster, must yield mutual adjacency with
+    /// weight exactly 1.0 — and no self-loops in the output (the
+    /// intra-cluster mass of each triangle is density, not adjacency).
+    #[test]
+    fn cluster_adjacency_hand_computed_on_bridged_triangles() {
+        let mk = |k: &str| Node::fresh(NodeKind::new(k));
+        let nodes: Vec<Node> = (0..6).map(|_| mk("v")).collect();
+        let e = EdgeKind::new("e");
+        let mut edges = vec![
+            Edge::fresh(nodes[0].id, nodes[1].id, e.clone()),
+            Edge::fresh(nodes[1].id, nodes[2].id, e.clone()),
+            Edge::fresh(nodes[2].id, nodes[0].id, e.clone()),
+            Edge::fresh(nodes[3].id, nodes[4].id, e.clone()),
+            Edge::fresh(nodes[4].id, nodes[5].id, e.clone()),
+            Edge::fresh(nodes[5].id, nodes[3].id, e.clone()),
+        ];
+        // The single bridge.
+        edges.push(Edge::fresh(nodes[0].id, nodes[3].id, e.clone()));
+        let src = SliceSource::new(&nodes, &edges);
+        let g = Graph::from_source(&src).unwrap();
+        let p = Partition::new(vec![0, 0, 0, 1, 1, 1]);
+
+        let adj = cluster_adjacency(&g, &p);
+        assert_eq!(adj.len(), 2);
+        assert_eq!(adj[0], vec![(1, 1.0)]);
+        assert_eq!(adj[1], vec![(0, 1.0)]);
+    }
+
+    /// `cluster_adjacency` on clusters with no inter-cluster edges
+    /// must return empty lists — not self-loops, not phantom edges.
+    #[test]
+    fn cluster_adjacency_disjoint_clusters_have_no_neighbors() {
+        let mk = |k: &str| Node::fresh(NodeKind::new(k));
+        let nodes: Vec<Node> = (0..6).map(|_| mk("v")).collect();
+        let e = EdgeKind::new("e");
+        let edges = vec![
+            Edge::fresh(nodes[0].id, nodes[1].id, e.clone()),
+            Edge::fresh(nodes[1].id, nodes[2].id, e.clone()),
+            Edge::fresh(nodes[2].id, nodes[0].id, e.clone()),
+            Edge::fresh(nodes[3].id, nodes[4].id, e.clone()),
+            Edge::fresh(nodes[4].id, nodes[5].id, e.clone()),
+            Edge::fresh(nodes[5].id, nodes[3].id, e.clone()),
+        ];
+        let src = SliceSource::new(&nodes, &edges);
+        let g = Graph::from_source(&src).unwrap();
+        let p = Partition::new(vec![0, 0, 0, 1, 1, 1]);
+
+        let adj = cluster_adjacency(&g, &p);
+        assert!(adj.iter().all(Vec::is_empty));
+    }
+
+    /// Real-graph invariants on Zachary with a Leiden partition:
+    /// the adjacency relation is symmetric (weight(c→d) == weight(d→c))
+    /// and complete — the total adjacency mass equals exactly twice the
+    /// inter-cluster edge mass counted directly on Layer 0. Deleting
+    /// either property silently breaks corridor routing built on top.
+    #[test]
+    fn cluster_adjacency_symmetric_and_complete_on_zachary() {
+        let src = crate::gml::GmlSource::from_path(
+            "tests/fixtures/karate.gml",
+            &NodeKind::new("m"),
+            &EdgeKind::new("f"),
+        )
+        .unwrap();
+        let g = Graph::from_source(&src).unwrap();
+        let p = leiden(&g);
+        let adj = cluster_adjacency(&g, &p);
+
+        // Symmetry.
+        for (c, ns) in adj.iter().enumerate() {
+            for &(d, w) in ns {
+                let (_, back) = adj[d]
+                    .iter()
+                    .find(|&&(e_, _)| e_ == c)
+                    .unwrap_or_else(|| panic!("edge {c}->{d} has no mirror"));
+                assert!((back - w).abs() < 1e-9, "asymmetric weight {c}<->{d}");
+            }
+        }
+
+        // Completeness: sum of all adjacency weights == 2 × the
+        // inter-cluster edge mass counted on the original graph
+        // (each super-edge appears in both endpoints' lists).
+        let mut inter = 0.0;
+        for u in 0..g.node_count() {
+            for (v, w) in g.neighbors(u) {
+                if v > u && p.community_of(u) != p.community_of(v) {
+                    inter += w;
+                }
+            }
+        }
+        let adj_total: f64 = adj.iter().flatten().map(|&(_, w)| w).sum();
+        assert!(
+            (adj_total - 2.0 * inter).abs() < 1e-9,
+            "adjacency mass {adj_total} != 2 × inter-cluster mass {inter}"
+        );
+        // Zachary has cross-community edges under any sane partition.
+        assert!(inter > 0.0);
     }
 }

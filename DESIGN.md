@@ -17,7 +17,7 @@ A novel database index that exploits emergent small-world topology to make prope
 | Query API | `query(pattern, opts)`, `query_as_of`, unanchored entry | `QueryKind::{SameCluster, Similar}` anchored at an existing node; no patterns, no time-travel |
 | Build | Parallel, O(N log N), billions of nodes | In-memory, single-threaded, rebuild-only; benchmarked to N=50k |
 | Incremental maintenance | Ada-IVF adaptive re-clustering | Phase-1 scaffolding: `insert_node` majority-vote + drift tracking; only policy is `NeverRebalance` |
-| Storage | Fjall v3 hot + Parquet/Iceberg cold tier | Fjall v2, nine partitions; **no cold tier** |
+| Storage | Fjall v3 hot + Parquet/Iceberg cold tier | Fjall v2, ten partitions; **no cold tier** |
 | Crate stack | tokio, petgraph, arrow, iceberg, dashmap, … | fjall, serde, tracing, uuid, clap — nothing async, no columnar deps |
 | Module layout | Multi-crate workspace, nested modules | Single crate, flat `src/*.rs` |
 | Measured query scaling | O(log N) typical | **O(cluster_size)** — see BENCHMARKS.md "What the data does and doesn't show" |

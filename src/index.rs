@@ -3,7 +3,7 @@
 //! # What this module ships
 //!
 //! [`SwIndex`] — the on-disk, query-time face of the four-layer
-//! architecture. It wraps a Fjall keyspace with nine partitions
+//! architecture. It wraps a Fjall keyspace with ten partitions
 //! ("keyspaces" in the design doc's vocabulary) that hold the
 //! structural metadata produced by Layers 0–3, the label lookup
 //! tables (issue #55), and the incremental-maintenance bookkeeping
@@ -20,6 +20,7 @@
 //! | `cluster_drift`   | `ClusterId` (u32 LE) | `{generation: u64, delta_inserts: u32}` (12 B) | Per-cluster insert pressure since last rebuild (Phase 1) |
 //! | `labels`          | `Uuid7` (16 B) | `FORMAT_V1` + UTF-8 string | Human-readable name per node (e.g. `db.table`) |
 //! | `label_to_uuid`   | UTF-8 string   | `Uuid7` (16 B) | Reverse lookup for name-based queries |
+//! | `cluster_neighbors` | `ClusterId` (u32 LE) | `FORMAT_V1` + length-prefixed `Vec<(ClusterId, f32)>` | Cluster super-graph adjacency — inter-cluster edge mass (issue #70) |
 //!
 //! # On-disk footprint
 //!
@@ -211,7 +212,7 @@ const FORMAT_V1: u8 = 0x01;
 
 /// The persisted small-world property-graph index.
 ///
-/// `SwIndex` wraps a Fjall keyspace plus nine partitions. Open one at
+/// `SwIndex` wraps a Fjall keyspace plus ten partitions. Open one at
 /// a directory path with [`SwIndex::open`]; populate it with
 /// [`SwIndex::build_from_source`]; query it with the various read
 /// accessors. The same path reopened later yields the same data
@@ -240,6 +241,14 @@ pub struct SwIndex {
     /// updated by `insert_node`. Read by `drift_report` and
     /// `maintain`. New in Phase 1 (issue #52).
     cluster_drift: PartitionHandle,
+    /// The cluster super-graph adjacency — `ClusterId` (u32 LE) →
+    /// `FORMAT_V1` + length-prefixed `Vec<(ClusterId, f32)>`, where
+    /// the weight is the total inter-cluster edge mass. Self-loops
+    /// excluded; lists sorted ascending by neighbor id; symmetric.
+    /// Written by `build_from_source` for every cluster (empty list
+    /// included). The Gate-0 substrate for corridor routing and the
+    /// baseline arm of the Gate-1 experiment (issue #70).
+    cluster_neighbors: PartitionHandle,
 }
 
 /// Errors from any [`SwIndex`] operation.
@@ -485,8 +494,12 @@ impl SwIndex {
         // simply have an empty partition until the next build_from_source
         // populates it. Decoders treat "no entry" as `{generation: 0,
         // delta_inserts: 0}` so reads stay valid in the meantime.
-        let cluster_drift = keyspace.open_partition("cluster_drift", opts)?;
-        debug!("keyspace + 9 partitions opened");
+        let cluster_drift = keyspace.open_partition("cluster_drift", opts.clone())?;
+        // cluster_neighbors is created lazily — indexes built before
+        // issue #70 have an empty partition until the next build; the
+        // accessor treats "no entry" as an empty neighbor list.
+        let cluster_neighbors = keyspace.open_partition("cluster_neighbors", opts)?;
+        debug!("keyspace + 10 partitions opened");
         Ok(Self {
             keyspace,
             uuid_to_cluster,
@@ -498,6 +511,7 @@ impl SwIndex {
             labels,
             label_to_uuid,
             cluster_drift,
+            cluster_neighbors,
         })
     }
 
@@ -509,7 +523,7 @@ impl SwIndex {
     /// **This rebuilds from scratch.** Calling `build_from_source` on a
     /// keyspace that already contains data atomically *replaces* it:
     /// the same batch that writes the new build first stages a remove
-    /// of every existing key in all nine partitions, so entries from
+    /// of every existing key in all ten partitions, so entries from
     /// prior builds — UUIDs, labels, hub adjacency, cluster
     /// members/meta/drift — cannot survive a source that no longer
     /// contains them (issue #64). Readers observe either the complete
@@ -574,6 +588,16 @@ impl SwIndex {
         };
         debug!(regions = regions.region_count(), "layer 3 — regions done");
 
+        // Step 3b: cluster super-graph adjacency (issue #70) — the
+        // routing substrate for cluster-level corridors and the
+        // baseline arm of the Gate-1 navigation experiment. Same
+        // aggregation the regions pass runs internally; re-deriving
+        // costs O(E), noise next to Leiden on the same graph.
+        let adjacency = {
+            let _phase = debug_span!("swindex.build.cluster_adjacency").entered();
+            crate::community::cluster_adjacency(&graph, &clusters)
+        };
+
         // Step 4: hub set (Layer 2a) + hub graph (Layer 2b). The
         // strategy decides which structural signal selects hubs;
         // see `HubStrategy` for the trade-offs (issue #68 wired
@@ -623,6 +647,7 @@ impl SwIndex {
             &self.labels,
             &self.label_to_uuid,
             &self.cluster_drift,
+            &self.cluster_neighbors,
         ] {
             for entry in partition.iter() {
                 let (key, _) = entry?;
@@ -729,6 +754,29 @@ impl SwIndex {
                 cluster_id.to_le_bytes().as_slice(),
                 encode_cluster_drift(0, 0),
             );
+
+            // Cluster super-graph adjacency (issue #70). Persisted
+            // for every cluster, empty list included, so the accessor
+            // can't confuse "isolated cluster" with "pre-#70 index".
+            let mut neighbor_list: Vec<(u32, f32)> = Vec::new();
+            if let Some(ns) = adjacency.get(cluster_id_usize) {
+                for &(d, w) in ns {
+                    let did = u32::try_from(d).map_err(|_| {
+                        SwIndexError::Corruption("cluster id exceeds u32 range".into())
+                    })?;
+                    // f64 -> f32 narrowing matches hub_neighbors:
+                    // inter-cluster edge mass fits f32 comfortably at
+                    // every validated scale.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let w32 = w as f32;
+                    neighbor_list.push((did, w32));
+                }
+            }
+            batch.insert(
+                &self.cluster_neighbors,
+                cluster_id.to_le_bytes().as_slice(),
+                encode_cluster_neighbors(&neighbor_list)?,
+            );
         }
 
         // Atomic commit + fsync. After this returns, a fresh open() of
@@ -811,6 +859,27 @@ impl SwIndex {
         let raw = self.hub_neighbors.get(hub.as_bytes().as_slice())?;
         match raw {
             Some(b) => decode_hub_neighbors(&b, "hub_neighbors"),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The cluster super-graph neighbors of a cluster — each
+    /// `(neighbor_cluster, weight)` is the total inter-cluster edge
+    /// mass between the two clusters, sorted ascending by neighbor
+    /// id. Empty for isolated clusters, unknown cluster ids, and
+    /// indexes built before issue #70.
+    ///
+    /// # Errors
+    ///
+    /// [`SwIndexError::Fjall`] for read failures;
+    /// [`SwIndexError::Corruption`] / [`SwIndexError::UnsupportedFormat`]
+    /// for malformed stored data.
+    pub fn cluster_neighbors(&self, cluster_id: u32) -> Result<Vec<(u32, f32)>, SwIndexError> {
+        let raw = self
+            .cluster_neighbors
+            .get(cluster_id.to_le_bytes().as_slice())?;
+        match raw {
+            Some(b) => decode_cluster_neighbors(&b, "cluster_neighbors"),
             None => Ok(Vec::new()),
         }
     }
@@ -1449,7 +1518,7 @@ impl fmt::Debug for SwIndex {
         // Compact summary — we don't dump the keyspace contents in
         // panic output; that would be enormous.
         f.debug_struct("SwIndex")
-            .field("partitions", &9_usize)
+            .field("partitions", &10_usize)
             .finish()
     }
 }
@@ -1523,6 +1592,60 @@ fn decode_uuid_vec(bytes: &[u8], context: &'static str) -> Result<Vec<Uuid7>, Sw
         out.push(wrapped);
     }
     Ok(out)
+}
+
+/// `FORMAT_V1` + u32 LE count + per item (u32 LE cluster id, f32 LE
+/// weight). Same shape as the hub-neighbors encoding with 4-byte ids
+/// instead of 16-byte uuids.
+fn encode_cluster_neighbors(items: &[(u32, f32)]) -> Result<Vec<u8>, SwIndexError> {
+    let len = u32::try_from(items.len())
+        .map_err(|_| SwIndexError::Corruption("cluster-neighbors len exceeds u32".into()))?;
+    let mut buf = Vec::with_capacity(1 + 4 + items.len() * 8);
+    buf.push(FORMAT_V1);
+    buf.extend_from_slice(&len.to_le_bytes());
+    for (cluster, w) in items {
+        buf.extend_from_slice(&cluster.to_le_bytes());
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    Ok(buf)
+}
+
+fn decode_cluster_neighbors(
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<Vec<(u32, f32)>, SwIndexError> {
+    let body = read_format_byte(bytes, context)?;
+    if body.len() < 4 {
+        return Err(SwIndexError::Corruption(format!(
+            "{context}: payload body < 4 bytes after version byte"
+        )));
+    }
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&body[0..4]);
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    // Checked arithmetic: a corrupt length must produce a Corruption
+    // error, not an overflow panic (or wraparound on 32-bit targets).
+    let expected = len
+        .checked_mul(8)
+        .and_then(|b| b.checked_add(4))
+        .ok_or_else(|| {
+            SwIndexError::Corruption(format!("{context}: entry count {len} overflows"))
+        })?;
+    if body.len() != expected {
+        return Err(SwIndexError::Corruption(format!(
+            "{context}: expected {expected} bytes for {len} entries, got {}",
+            body.len()
+        )));
+    }
+    let mut items = Vec::with_capacity(len);
+    for chunk in body[4..].chunks_exact(8) {
+        let mut id_bytes = [0u8; 4];
+        id_bytes.copy_from_slice(&chunk[0..4]);
+        let mut w_bytes = [0u8; 4];
+        w_bytes.copy_from_slice(&chunk[4..8]);
+        items.push((u32::from_le_bytes(id_bytes), f32::from_le_bytes(w_bytes)));
+    }
+    Ok(items)
 }
 
 fn encode_hub_neighbors(items: &[(Uuid7, f32)]) -> Result<Vec<u8>, SwIndexError> {
@@ -2762,6 +2885,69 @@ mod tests {
         // The incrementally-inserted node was not in the rebuild
         // source, so it must be gone too.
         assert!(idx.cluster_of(newcomer.id).unwrap().is_none());
+    }
+
+    /// Issue #70: the build persists the cluster super-graph; the
+    /// adjacency survives close/reopen; and a rebuild replaces it
+    /// (a previously-adjacent cluster id must come back empty after
+    /// rebuilding from a source with no inter-cluster edges).
+    #[test]
+    fn build_persists_cluster_adjacency_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, mut edges) = two_disjoint_triangles();
+        // Bridge the triangles with one edge: adjacency weight 1.0.
+        edges.push(Edge::fresh(nodes[0].id, nodes[3].id, EdgeKind::new("e")));
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        let c0 = idx.cluster_of(nodes[0].id).unwrap().unwrap();
+        let c1 = idx.cluster_of(nodes[3].id).unwrap().unwrap();
+        assert_ne!(c0, c1, "bridged triangles should still split");
+        assert_eq!(idx.cluster_neighbors(c0).unwrap(), vec![(c1, 1.0_f32)]);
+        assert_eq!(idx.cluster_neighbors(c1).unwrap(), vec![(c0, 1.0_f32)]);
+
+        // Survives close + reopen.
+        drop(idx);
+        let idx = SwIndex::open(dir.path()).unwrap();
+        assert_eq!(idx.cluster_neighbors(c0).unwrap(), vec![(c1, 1.0_f32)]);
+
+        // Rebuild from the disjoint version: same cluster count, but
+        // adjacency must be cleared — c0's old neighbor list cannot
+        // survive (issue #64 clearing covers the new partition).
+        let mut idx = idx;
+        let (nodes_b, edges_b) = two_disjoint_triangles();
+        let src_b = SliceSource::new(&nodes_b, &edges_b);
+        idx.build_from_source(&src_b).unwrap();
+        assert!(idx.cluster_neighbors(c0).unwrap().is_empty());
+        assert!(idx.cluster_neighbors(c1).unwrap().is_empty());
+    }
+
+    /// Issue #70 codec: round-trip including the empty list, plus
+    /// corrupt-length rejection — a truncated payload must surface as
+    /// Corruption, never a panic.
+    #[test]
+    fn cluster_neighbors_codec_round_trip_and_corruption() {
+        use super::{decode_cluster_neighbors, encode_cluster_neighbors};
+
+        let items = vec![(3_u32, 1.5_f32), (7, 0.25)];
+        let buf = encode_cluster_neighbors(&items).unwrap();
+        assert_eq!(decode_cluster_neighbors(&buf, "test").unwrap(), items);
+
+        let empty = encode_cluster_neighbors(&[]).unwrap();
+        assert!(decode_cluster_neighbors(&empty, "test").unwrap().is_empty());
+
+        // Truncated body → Corruption.
+        let err = decode_cluster_neighbors(&buf[..buf.len() - 1], "test").unwrap_err();
+        assert!(matches!(err, SwIndexError::Corruption(_)));
+        // Future format version → UnsupportedFormat.
+        let mut versioned = buf.clone();
+        versioned[0] = 0x02;
+        let err = decode_cluster_neighbors(&versioned, "test").unwrap_err();
+        assert!(matches!(
+            err,
+            SwIndexError::UnsupportedFormat { found: 0x02, .. }
+        ));
     }
 
     #[test]

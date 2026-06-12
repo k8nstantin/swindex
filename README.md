@@ -34,7 +34,7 @@ swindex stores **only structural metadata** (cluster assignments, hub graph, clu
 | Layer | Structure | Purpose | Status |
 |---|---|---|---|
 | 3 | Region graph | "Which region(s) does this query touch?" Recursive Leiden over clusters. | Built + persisted; **not yet consulted at query time** (v0.2). |
-| 2 | Hub graph | "Highway" — connected by k-hop BFS edges. Long-range navigation. | Built + persisted; queries do a **one-hop expansion** from one entry hub. Default selection is top 10% by degree (design target 0.1–1%; betweenness selection shipped, build wiring tracked in v0.2). |
+| 2 | Hub graph | "Highway" — connected by k-hop BFS edges. Long-range navigation. | Built + persisted; queries do a **one-hop expansion** from one entry hub. Default selection is degree ∪ betweenness, 10% per criterion (design target 0.1–1%; tunable via `SwConfig`). |
 | 1 | Cluster graph | Leiden-detected communities. Mathematically guaranteed well-connected (Leiden 2019). | Fully wired: every query starts here. |
 | 0 | Full fact graph | Ground truth nodes + edges. | Lives in **your** store; swindex persists only the structural metadata above. |
 
@@ -126,7 +126,7 @@ The full design — Leiden community detection, hub-graph navigation, four-layer
 | `index` | `SwIndex` — persisted public face: open / build / query / stats |
 
 What's **not** in v0.1.0 (see [open issues](https://github.com/k8nstantin/swindex/issues) for the v0.2 roadmap):
-- ~~Approximate betweenness centrality (Brandes' algorithm) — issue #23~~ Shipped on `main` (unreleased): `betweenness` module + `HubSet::from_centrality`. `build_from_source` still selects hubs by degree; wiring is v0.2 work.
+- ~~Approximate betweenness centrality (Brandes' algorithm) — issue #23~~ Shipped on `main` (unreleased): `betweenness` module + `HubSet::from_centrality`, and `build_from_source` now defaults to degree ∪ betweenness hub selection via `SwConfig` (#68).
 - Region routing + multi-hop hub navigation in the query planner (queries currently use cluster lookup + one-hop hub expansion)
 - Incremental Ada-IVF maintenance — issue #27
 - Benchmark suite at 10⁴–10⁷ scale — issue #28

@@ -96,12 +96,107 @@ use uuid::Uuid;
 // 10% is an interim default chosen so tiny academic fixtures (Zachary:
 // 34 nodes) still yield a usable hub set — it is 10–100× the design
 // target (`DESIGN.md` says 0.1–1%; `from_top_fraction`'s documented
-// operational range tops out at 5%). Production tuning lives at the
-// caller via a future `SwConfig` parameter (tracked with the
-// betweenness build-wiring work).
+// operational range tops out at 5%). Production callers tune it via
+// [`SwConfig::hub_fraction`].
 const DEFAULT_HUB_FRACTION: f64 = 0.10;
 // Hub-graph k_hop default. Per `DESIGN.md` line 102.
 const DEFAULT_HUB_GRAPH_K_HOP: usize = 3;
+// Default BFS source-sample count for betweenness-based hub
+// selection. Bader/Kintali/Madduri/Mihail (2007) show O((log V)/ε²)
+// sources give tight rank estimates; 256 covers that comfortably for
+// every graph size this crate has been validated on (≤ 50k nodes)
+// while keeping the build's betweenness pass at O(256·(V+E)). Graphs
+// smaller than 256 nodes get exact Brandes (samples >= V).
+const DEFAULT_BETWEENNESS_SAMPLES: usize = 256;
+// Default RNG seed for betweenness source sampling — the repo-wide
+// convention seed (benches and fixtures use 42 throughout).
+const DEFAULT_BETWEENNESS_SEED: u64 = 42;
+
+/// How [`SwIndex::build_from_source_with`] selects Layer-2 hubs.
+///
+/// The design doc's construction algorithm flags a node as a hub if
+/// it passes the degree threshold **or** the centrality threshold —
+/// that composite is [`HubStrategy::DegreeAndBetweenness`], the
+/// default. The single-criterion variants exist for callers that
+/// want today's degree-only behavior (cheapest) or pure bridge
+/// detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HubStrategy {
+    /// Top `hub_fraction` of nodes by weighted degree — the *busy*
+    /// nodes. Cheapest (one sort); structurally blind to low-degree
+    /// bridges. This was the only behavior before issue #68.
+    Degree,
+    /// Top `hub_fraction` by approximate betweenness centrality
+    /// (Brandes' algorithm over `samples` seeded BFS sources) — the
+    /// *pivotal* nodes, including low-degree bridges that degree
+    /// detection structurally cannot see. `samples >= V` is exact.
+    Betweenness {
+        /// BFS source-sample count for [`crate::approximate_betweenness`].
+        samples: usize,
+        /// RNG seed for source sampling (determinism contract: same
+        /// graph + samples + seed → identical hub set).
+        seed: u64,
+    },
+    /// The union of both criteria, each taking `hub_fraction`
+    /// independently — the design doc's composite. Busy nodes keep
+    /// the highway wide; bridge nodes keep it hole-free where
+    /// communities meet. The hub set can reach 2× `hub_fraction` when
+    /// the criteria disagree completely.
+    DegreeAndBetweenness {
+        /// BFS source-sample count for [`crate::approximate_betweenness`].
+        samples: usize,
+        /// RNG seed for source sampling.
+        seed: u64,
+    },
+}
+
+impl Default for HubStrategy {
+    fn default() -> Self {
+        Self::DegreeAndBetweenness {
+            samples: DEFAULT_BETWEENNESS_SAMPLES,
+            seed: DEFAULT_BETWEENNESS_SEED,
+        }
+    }
+}
+
+/// Build-time configuration for [`SwIndex::build_from_source_with`].
+///
+/// The config parameterizes the *build pipeline* — it is not
+/// persisted with the index (build provenance/meta persistence is a
+/// separate roadmap item). [`SwIndex::build_from_source`] uses
+/// `SwConfig::default()`.
+///
+/// # Defaults
+///
+/// * `hub_fraction = 0.10` — interim, sized for academic fixtures;
+///   the design target is 0.1–1% (`DESIGN.md`). Tune down for
+///   production-scale graphs.
+/// * `hub_strategy = DegreeAndBetweenness { samples: 256, seed: 42 }`
+///   — the live pipeline finds bridge nodes out of the box (closes
+///   the gap issue #23 was opened for).
+/// * `hub_graph_k_hop = 3` — per `DESIGN.md`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwConfig {
+    /// Fraction of nodes (per criterion) flagged as hubs, clamped to
+    /// `[0, 1]` by the underlying [`HubSet`] constructors.
+    pub hub_fraction: f64,
+    /// Hub selection criterion — see [`HubStrategy`].
+    pub hub_strategy: HubStrategy,
+    /// Maximum BFS hop distance for hub-graph adjacency
+    /// ([`HubGraph::build`]'s `k_hop`).
+    pub hub_graph_k_hop: usize,
+}
+
+impl Default for SwConfig {
+    fn default() -> Self {
+        Self {
+            hub_fraction: DEFAULT_HUB_FRACTION,
+            hub_strategy: HubStrategy::default(),
+            hub_graph_k_hop: DEFAULT_HUB_GRAPH_K_HOP,
+        }
+    }
+}
 
 /// Version byte prepended to every variable-length value written by
 /// this build. Encoders write it; decoders refuse anything else. Bump
@@ -429,13 +524,29 @@ impl SwIndex {
     /// * [`SwIndexError::Corruption`] — a cluster or region id exceeded
     ///   the u32 storage limit (would only happen with > 4 B
     ///   communities; not realistically reachable).
+    pub fn build_from_source<G: GraphSource>(
+        &mut self,
+        source: &G,
+    ) -> Result<BuildStats, SwIndexError> {
+        self.build_from_source_with(source, &SwConfig::default())
+    }
+
+    /// [`Self::build_from_source`] with an explicit [`SwConfig`] —
+    /// hub fraction, hub selection strategy, and hub-graph k-hop.
+    /// Same pipeline, same atomicity and rebuild semantics; the
+    /// config is *not* persisted with the index.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build_from_source`].
     // Long but linear: 5 pipeline phases inline so the tracing spans
     // line up cleanly with the code structure. Splitting into helper
     // methods would obscure that mapping.
     #[allow(clippy::too_many_lines)]
-    pub fn build_from_source<G: GraphSource>(
+    pub fn build_from_source_with<G: GraphSource>(
         &mut self,
         source: &G,
+        config: &SwConfig,
     ) -> Result<BuildStats, SwIndexError> {
         let _span = info_span!("swindex.build").entered();
 
@@ -463,16 +574,31 @@ impl SwIndex {
         };
         debug!(regions = regions.region_count(), "layer 3 — regions done");
 
-        // Step 4: hub set (Layer 2a) + hub graph (Layer 2b).
+        // Step 4: hub set (Layer 2a) + hub graph (Layer 2b). The
+        // strategy decides which structural signal selects hubs;
+        // see `HubStrategy` for the trade-offs (issue #68 wired
+        // betweenness in here — previously degree-only, which is
+        // structurally blind to low-degree bridge nodes).
         let hubs = {
             let _phase = debug_span!("swindex.build.hubs").entered();
-            HubSet::from_top_fraction(&graph, DEFAULT_HUB_FRACTION)
+            match config.hub_strategy {
+                HubStrategy::Degree => HubSet::from_top_fraction(&graph, config.hub_fraction),
+                HubStrategy::Betweenness { samples, seed } => {
+                    HubSet::from_centrality(&graph, samples, config.hub_fraction, seed)
+                }
+                HubStrategy::DegreeAndBetweenness { samples, seed } => {
+                    let by_degree = HubSet::from_top_fraction(&graph, config.hub_fraction);
+                    let by_centrality =
+                        HubSet::from_centrality(&graph, samples, config.hub_fraction, seed);
+                    by_degree.union(&by_centrality)
+                }
+            }
         };
-        debug!(hubs = hubs.len(), "layer 2a — hub set");
+        debug!(hubs = hubs.len(), strategy = ?config.hub_strategy, "layer 2a — hub set");
 
         let hub_graph = {
             let _phase = debug_span!("swindex.build.hub_graph").entered();
-            HubGraph::build(&graph, &hubs, DEFAULT_HUB_GRAPH_K_HOP)
+            HubGraph::build(&graph, &hubs, config.hub_graph_k_hop)
         };
         debug!(edges = hub_graph.edge_count(), "layer 2b — hub graph");
 
@@ -2453,6 +2579,130 @@ mod tests {
         let c = idx.cluster_of(nodes_b[0].id).unwrap().unwrap();
         let members = idx.cluster_members(c).unwrap().unwrap();
         assert_eq!(members.len(), 3);
+    }
+
+    /// Two 4-cliques joined by a single low-degree bridge node — the
+    /// structure degree-based hub detection cannot see (the bridge
+    /// has the lowest degree but the highest betweenness; same
+    /// fixture as `betweenness::tests`). Returns (nodes, edges,
+    /// bridge_index_into_nodes).
+    fn bridge_of_two_cliques() -> (Vec<crate::node::Node>, Vec<Edge>, usize) {
+        let clique = 4_usize;
+        let mut nodes: Vec<crate::node::Node> = Vec::new();
+        for _ in 0..2 * clique {
+            nodes.push(crate::node::Node::fresh(NodeKind::new("v")));
+        }
+        let bridge_idx = 2 * clique;
+        nodes.push(crate::node::Node::fresh(NodeKind::new("v")));
+
+        let kind = EdgeKind::new("e");
+        let mut edges: Vec<Edge> = Vec::new();
+        for c in 0..2 {
+            let base = c * clique;
+            for i in base..base + clique {
+                for j in (i + 1)..base + clique {
+                    edges.push(Edge::fresh(nodes[i].id, nodes[j].id, kind.clone()));
+                }
+            }
+        }
+        edges.push(Edge::fresh(nodes[0].id, nodes[bridge_idx].id, kind.clone()));
+        edges.push(Edge::fresh(
+            nodes[clique].id,
+            nodes[bridge_idx].id,
+            kind.clone(),
+        ));
+        (nodes, edges, bridge_idx)
+    }
+
+    /// Issue #68 acceptance: the DEFAULT build pipeline must flag the
+    /// bridge node as a hub. Before the SwConfig wiring the build was
+    /// degree-only and this assertion failed — the exact gap issue
+    /// #23 was opened to close, now verified through the persisted
+    /// index rather than the algorithm in isolation.
+    #[test]
+    fn default_build_flags_bridge_node_as_hub() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges, bridge) = bridge_of_two_cliques();
+        let src = SliceSource::new(&nodes, &edges);
+        idx.build_from_source(&src).unwrap();
+
+        assert!(
+            idx.is_hub(nodes[bridge].id).unwrap(),
+            "default (DegreeAndBetweenness) build must flag the bridge as a hub"
+        );
+        // The union also keeps the busy nodes: the highest-degree
+        // node (clique node 0, degree 4) stays a hub.
+        assert!(idx.is_hub(nodes[0].id).unwrap());
+    }
+
+    /// Issue #68: `HubStrategy::Degree` reproduces the pre-#68
+    /// behavior exactly — the bridge is invisible to it.
+    #[test]
+    fn degree_strategy_reproduces_legacy_hub_selection() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges, bridge) = bridge_of_two_cliques();
+        let src = SliceSource::new(&nodes, &edges);
+        let config = super::SwConfig {
+            hub_strategy: super::HubStrategy::Degree,
+            ..super::SwConfig::default()
+        };
+        let stats = idx.build_from_source_with(&src, &config).unwrap();
+
+        // 9 nodes at 10% → exactly 1 hub, and it is not the bridge.
+        assert_eq!(stats.hubs, 1);
+        assert!(!idx.is_hub(nodes[bridge].id).unwrap());
+    }
+
+    /// Issue #68: hub_fraction is honored — 1.0 flags every node.
+    #[test]
+    fn config_hub_fraction_is_honored() {
+        let dir = TempDir::new().unwrap();
+        let mut idx = SwIndex::open(dir.path()).unwrap();
+        let (nodes, edges) = two_disjoint_triangles();
+        let src = SliceSource::new(&nodes, &edges);
+        let config = super::SwConfig {
+            hub_fraction: 1.0,
+            ..super::SwConfig::default()
+        };
+        let stats = idx.build_from_source_with(&src, &config).unwrap();
+        assert_eq!(stats.hubs, nodes.len());
+        for n in &nodes {
+            assert!(idx.is_hub(n.id).unwrap());
+        }
+    }
+
+    /// Issue #68 determinism contract: same source + same config
+    /// (sub-V sampled betweenness, so the seeded path is exercised)
+    /// → identical hub flags across independent builds.
+    #[test]
+    fn build_with_sampled_betweenness_is_deterministic() {
+        let (nodes, edges, _) = bridge_of_two_cliques();
+        let src = SliceSource::new(&nodes, &edges);
+        let config = super::SwConfig {
+            hub_strategy: super::HubStrategy::Betweenness {
+                samples: 4, // < V = 9, so the seed matters
+                seed: 7,
+            },
+            ..super::SwConfig::default()
+        };
+
+        let dir_a = TempDir::new().unwrap();
+        let mut idx_a = SwIndex::open(dir_a.path()).unwrap();
+        idx_a.build_from_source_with(&src, &config).unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let mut idx_b = SwIndex::open(dir_b.path()).unwrap();
+        idx_b.build_from_source_with(&src, &config).unwrap();
+
+        for n in &nodes {
+            assert_eq!(
+                idx_a.is_hub(n.id).unwrap(),
+                idx_b.is_hub(n.id).unwrap(),
+                "hub flag for {} differs across identical builds",
+                n.id.as_uuid()
+            );
+        }
     }
 
     /// Issue #64: the clear-then-reinsert pass must be invisible when

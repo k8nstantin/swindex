@@ -95,7 +95,7 @@ Anything that touches `src/index.rs` storage layout requires:
 
 ## 8. Documentation
 
-- **`DESIGN.md` is authoritative.** It describes the architecture and the conventions (modularity formula, aggregation, etc.). When the code diverges from `DESIGN.md`, one of the two is wrong — fix it explicitly, don't let drift accumulate.
+- **`DESIGN.md` is the north-star, rustdoc is the ground truth.** `DESIGN.md` describes the *target* architecture and opens with an implementation-status table mapping each design element to what's actually shipped. For shipped behavior, the rustdoc (`src/lib.rs`, module docs) is authoritative. When the code diverges from the design in a way the status table doesn't capture, update the table in the same PR — don't let silent drift accumulate.
 - **`BENCHMARKS.md` reflects reality.** If you re-run benchmarks, update the numbers in the file. Don't put claims in PR descriptions that aren't in the doc.
 - **`CHANGELOG.md` updates per PR.** Add an entry under `[Unreleased]` describing the user-visible change.
 
@@ -111,8 +111,7 @@ By contributing, you agree your contribution is under the [BSL 1.1](LICENSE) lic
 
 ## 11. Questions?
 
-- File an issue on GitHub. We respond.
-- Discord channel: TBD (placeholder URL `discord.gg/swindex` until registered).
-- Direct contact: `hello@swindex.ai`.
+- File an issue on GitHub — this is the reliable channel. swindex is currently solo-maintained; expect a response from the maintainer, not a team.
+- There is no Discord or project email yet (a channel is tracked in issue #32; this section will be updated when one exists).
 
 Happy hacking.

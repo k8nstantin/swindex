@@ -6,10 +6,10 @@
     <title>swindex — the small-world index for property graphs</title>
     <meta
       name="description"
-      content="The hierarchical small-world index for property graphs. O(log N) multi-hop queries that scale to billions of nodes. Open-source Rust crate; your data stays in MySQL / Postgres / Iceberg / wherever."
+      content="The hierarchical small-world index for property graphs. Microsecond 'what's related to X' queries over a layered Leiden + hub-graph structure. Source-available Rust crate (BSL 1.1); your data stays in MySQL / Postgres / Iceberg / wherever."
     />
     <meta property="og:title" content="swindex — the small-world index for property graphs" />
-    <meta property="og:description" content="O(log N) multi-hop graph queries. Open-source Rust crate. Your data stays in MySQL / Iceberg / wherever — swindex is a sidecar." />
+    <meta property="og:description" content="Microsecond multi-hop graph queries. Source-available Rust crate (BSL 1.1). Your data stays in MySQL / Iceberg / wherever — swindex is a sidecar." />
     <meta property="og:type" content="website" />
     <meta name="theme-color" content="#1F062A" />
     <link rel="icon" type="image/svg+xml" href="favicon.svg" />
@@ -53,14 +53,14 @@
       <section class="hero">
         <div class="container hero__grid">
           <div class="hero__content">
-            <p class="eyebrow">v0.0.3 · early access · BSL 1.1</p>
+            <p class="eyebrow">v0.1.0 · early access · BSL 1.1</p>
             <h1 class="hero__title">
               swindex is the
               <span class="grad">small-world index</span>
               for property graphs
             </h1>
             <p class="hero__subtitle">
-              Multi-hop graph queries that scale to billions of nodes — O(log N) hub-aware traversal in pure Rust. Sits beside your existing store; never replaces it.
+              Multi-hop graph queries in microseconds — a layered Leiden + hub-graph index in pure Rust, designed toward O(log N) traversal at billion-node scale. Sits beside your existing store; never replaces it.
             </p>
             <div class="button-group">
               <a class="btn btn-primary" href="#install">
@@ -257,9 +257,9 @@ let src = SliceSource::new(&nodes, &edges);" aria-label="Copy">
               <div class="layer__id">2</div>
               <h3>Hub graph <span class="muted">— the highway</span></h3>
               <p>
-                ~0.1–1 % of nodes, selected by degree, betweenness centrality,
-                type, and institutional role. Queries traverse hubs first;
-                genuinely small-world, so this is the O(log N) step.
+                A small fraction of nodes, selected by degree and betweenness
+                centrality. The design's O(log N) navigation step; today's
+                queries do a one-hop expansion through it.
               </p>
             </article>
             <article class="layer">
@@ -298,9 +298,9 @@ let src = SliceSource::new(&nodes, &edges);" aria-label="Copy">
    ┌──────────────────────────┐
    │   swindex (Rust crate)   │
    │   ─────────────────────  │
-   │   • cluster of node X?   │   ← O(log N) hub-aware traversal
+   │   • cluster of node X?   │   ← microsecond cluster lookup
    │   • members of cluster?  │
-   │   • multi-hop pattern?   │
+   │   • nodes similar to X?  │
    │                          │   returns a small list of UUIDv7 ids
    └────────────┬─────────────┘
                 │

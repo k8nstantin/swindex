@@ -41,9 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_stats.nodes, build_stats.clusters, build_stats.regions, build_stats.hubs,
     );
 
-    // 3. Query the index. `Similar` walks the four-layer router:
-    //    cluster lookup → cluster_members → hub-graph expansion →
-    //    neighbor clusters' members. Truncated at `limit`.
+    // 3. Query the index. `Similar` walks the implemented route:
+    //    cluster lookup → cluster_members → one-hop hub-graph expansion
+    //    → neighbor clusters' members. Truncated at `limit`.
     let seed = src.nodes().next().expect("graph has at least one node");
 
     // limit=25 is larger than the seed's cluster (~12 members on

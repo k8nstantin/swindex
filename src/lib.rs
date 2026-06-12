@@ -6,17 +6,22 @@
 
 //! `swindex` — hierarchical small-world property-graph index.
 //!
-//! A persistent, online, query-routing index for property graphs. Built from
-//! Leiden community detection plus hub identification plus recursive
-//! aggregation; achieves O(log N) typical query complexity on graphs that
-//! exhibit emergent small-world structure.
+//! A persistent index for property graphs. Built from Leiden community
+//! detection plus hub identification plus recursive aggregation; designed
+//! toward O(log N) typical query complexity on graphs that exhibit
+//! emergent small-world structure (the design target — see `DESIGN.md`;
+//! `BENCHMARKS.md` documents what is actually measured today).
 //!
 //! See [`DESIGN.md`](https://github.com/k8nstantin/swindex/blob/main/DESIGN.md)
-//! in the repository root for the full design document. This is v0.0.8 —
-//! core types, the [`GraphSource`] boundary, a GML loader, an in-memory
-//! [`Graph`], Louvain & Leiden community detection, and degree-based hub
-//! detection. Approximate betweenness centrality, the hub graph,
-//! persistence, and the query planner land in subsequent releases.
+//! in the repository root for the target architecture, including its
+//! implementation-status table. Shipped today: core types, the
+//! [`GraphSource`] boundary, GML and mysqldump loaders, an in-memory
+//! [`Graph`], Louvain & Leiden community detection, degree- and
+//! betweenness-based hub detection, the hub graph, Fjall-backed
+//! persistence ([`index::SwIndex`]), and a structured query API
+//! (`SameCluster` / `Similar` — cluster lookup plus one-hop hub
+//! expansion). Region-aware routing and multi-hop hub navigation are
+//! v0.2 roadmap work.
 //!
 //! # Module map
 //!
@@ -45,7 +50,7 @@
 //!   mapping derived by running Leiden on the cluster super-graph
 //!   (recursive Leiden, same trick Microsoft GraphRAG uses offline).
 //! * [`index`] — [`index::SwIndex`], the persisted public face. Wraps a
-//!   Fjall keyspace with six partitions holding the four-layer
+//!   Fjall keyspace with nine partitions holding the four-layer
 //!   structural metadata. `build_from_source` runs the full Layer-0..3
 //!   pipeline and commits atomically; close + reopen round-trips
 //!   identical answers.

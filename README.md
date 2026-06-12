@@ -1,10 +1,10 @@
 # swindex
 
-A hierarchical small-world property-graph index in Rust. Builds and maintains a layered Leiden-community + hub-graph structure over arbitrary property graphs, so multi-hop traversal queries scale to billions of nodes with O(log N) typical latency — what HNSW does for vectors, but for arbitrary structured property data.
+A hierarchical small-world property-graph index in Rust. Builds and persists a layered Leiden-community + hub-graph structure over arbitrary property graphs, and answers "what's related to X" queries in microseconds against your existing store. The design target — hub-routed traversal that scales the way HNSW does for vectors — is documented in [`DESIGN.md`](DESIGN.md); what's measured today is microsecond queries at 50k-node scale ([`BENCHMARKS.md`](BENCHMARKS.md)).
 
 **swindex is an index, not a database.** Your data stays in whatever store already holds it — MySQL, Postgres, Iceberg, Parquet, Arrow, an HTTP API, whatever — and swindex sits alongside it as a sidecar that narrows multi-hop graph queries down to a small bounded set of candidates. Then your application goes back to its primary store to fetch the actual rows.
 
-**Status:** v0.1.0 released — [release notes](https://github.com/k8nstantin/swindex/releases/tag/v0.1.0). All four architecture layers shipped + persistence + structured query API. 80 tests passing.
+**Status:** v0.1.0 released — [release notes](https://github.com/k8nstantin/swindex/releases/tag/v0.1.0). All four architecture layers are built and persisted; queries currently route through two of them — cluster lookup plus one-hop hub expansion. Region routing and multi-hop hub navigation are tracked in the [v0.2 milestone](https://github.com/k8nstantin/swindex/issues). 142 tests passing.
 
 ## Architecture in 30 seconds
 
@@ -15,7 +15,7 @@ A hierarchical small-world property-graph index in Rust. Builds and maintains a 
               ┌──────────────────────────┐
               │   swindex (Rust crate)   │
               │   ─────────────────────  │
-              │   • cluster of node X?   │   ← O(log N) hub-aware traversal
+              │   • cluster of node X?   │   ← microsecond cluster lookup
               │   • members of cluster?  │
               │   • nodes similar to X?  │
               │                          │   returns a small list of UUIDv7 ids
@@ -27,16 +27,16 @@ A hierarchical small-world property-graph index in Rust. Builds and maintains a 
               └──────────────────────────┘
 ```
 
-swindex stores **only structural metadata** (cluster assignments, hub graph, cluster→region mapping, optionally history for time-travel queries) — backed by a Fjall LSM keyspace with six partitions. On disk that's typically 2–5% of the size of the underlying data. Your row payloads stay where they live.
+swindex stores **only structural metadata** (cluster assignments, hub graph, cluster→region mapping, human-readable labels) — backed by a Fjall LSM keyspace with nine partitions. On disk that's typically 2–5% of the size of the underlying data. Your row payloads stay where they live.
 
 ### The four layers
 
-| Layer | Structure | Purpose |
-|---|---|---|
-| 3 | Region graph | "Which region(s) does this query touch?" Recursive Leiden over clusters. |
-| 2 | Hub graph | "Highway" — ~0.1–5% of nodes, connected by k-hop BFS edges. Long-range navigation. |
-| 1 | Cluster graph | Leiden-detected communities. Mathematically guaranteed well-connected (Leiden 2019). |
-| 0 | Full fact graph | Ground truth nodes + edges. Touched only after upper layers narrow the search. |
+| Layer | Structure | Purpose | Status |
+|---|---|---|---|
+| 3 | Region graph | "Which region(s) does this query touch?" Recursive Leiden over clusters. | Built + persisted; **not yet consulted at query time** (v0.2). |
+| 2 | Hub graph | "Highway" — connected by k-hop BFS edges. Long-range navigation. | Built + persisted; queries do a **one-hop expansion** from one entry hub. Default selection is top 10% by degree (design target 0.1–1%; betweenness selection shipped, build wiring tracked in v0.2). |
+| 1 | Cluster graph | Leiden-detected communities. Mathematically guaranteed well-connected (Leiden 2019). | Fully wired: every query starts here. |
+| 0 | Full fact graph | Ground truth nodes + edges. | Lives in **your** store; swindex persists only the structural metadata above. |
 
 ## Quickstart
 
@@ -46,7 +46,7 @@ Clone and run the tests:
 git clone git@github.com:k8nstantin/swindex.git
 cd swindex
 cargo test
-# test result: ok. 80 passed; 0 failed
+# test result: ok. 133 passed; 0 failed   (plus 7 integration + 2 doc tests)
 ```
 
 Use as a dependency:
@@ -80,9 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_stats.regions, build_stats.hubs,
     );
 
-    // 3. Query the index. `Similar` walks the four-layer router:
-    //    cluster lookup → cluster_members → hub-graph expansion →
-    //    neighbor clusters' members. Truncated at `limit`.
+    // 3. Query the index. `Similar` walks the implemented route:
+    //    cluster lookup → cluster_members → one-hop hub-graph expansion
+    //    → neighbor clusters' members. Truncated at `limit`.
     use swindex::source::GraphSource;
     let seed = src.nodes().next().expect("graph has at least one node");
 
@@ -126,7 +126,8 @@ The full design — Leiden community detection, hub-graph navigation, four-layer
 | `index` | `SwIndex` — persisted public face: open / build / query / stats |
 
 What's **not** in v0.1.0 (see [open issues](https://github.com/k8nstantin/swindex/issues) for the v0.2 roadmap):
-- Approximate betweenness centrality (Brandes' algorithm) — issue #23
+- ~~Approximate betweenness centrality (Brandes' algorithm) — issue #23~~ Shipped on `main` (unreleased): `betweenness` module + `HubSet::from_centrality`. `build_from_source` still selects hubs by degree; wiring is v0.2 work.
+- Region routing + multi-hop hub navigation in the query planner (queries currently use cluster lookup + one-hop hub expansion)
 - Incremental Ada-IVF maintenance — issue #27
 - Benchmark suite at 10⁴–10⁷ scale — issue #28
 - Time-travel (`query_as_of`) — issue #29

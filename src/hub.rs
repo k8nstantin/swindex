@@ -28,15 +28,16 @@
 //! * [`HubSet::from_degree_threshold`] — every node with degree ≥ τ.
 //!   Used when you have an absolute degree target (e.g. "anyone with
 //!   at least 100 incident facts is a hub").
+//! * [`HubSet::from_centrality`] — top *k* % by **approximate
+//!   betweenness centrality** (Brandes' algorithm, issue #23). Finds
+//!   the *bridge* nodes — low-degree connectors between communities —
+//!   that the degree criteria above structurally cannot see. See
+//!   [`crate::betweenness`] for the algorithm.
 //! * [`HubSet::empty`] / [`HubSet::from_iter`] — for tests and callers
 //!   that want to construct a hub set manually.
 //!
 //! # What this module deliberately doesn't do yet
 //!
-//! * **Approximate betweenness centrality** — Brandes' algorithm with
-//!   sampling. Coming in a follow-up PR; on graphs up to ~10⁶ nodes,
-//!   degree-based detection alone gets within ~95% of the centrality-
-//!   identified hub set.
 //! * **Type-based hub eligibility** — flagging every node whose
 //!   `NodeKind` is in a configured `HUB_TYPES` set (e.g. registries,
 //!   institutional anchors). Trivial to add once consumers actually
@@ -143,6 +144,60 @@ impl HubSet {
                 .then(a.0.cmp(&b.0))
         });
 
+        indexed.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    /// Identify hubs as the top `top_fraction` of nodes by
+    /// **approximate betweenness centrality** (Brandes' algorithm with
+    /// `samples` sampled BFS sources; see
+    /// [`crate::betweenness::approximate_betweenness`]).
+    ///
+    /// Where [`Self::from_top_fraction`] finds the *busy* (high-degree)
+    /// nodes, this finds the *pivotal* ones — bridges that lie on the
+    /// shortest paths between communities even when their own degree is
+    /// modest. On graphs whose hubs are simply the high-degree nodes the
+    /// two criteria largely agree; on graphs with low-degree bridge
+    /// nodes (a single connector between two dense clusters) only the
+    /// centrality criterion finds them.
+    ///
+    /// `top_fraction` is clamped to `[0.0, 1.0]` and the cut count is
+    /// rounded **up** (so a non-zero fraction always yields at least one
+    /// hub), exactly matching [`Self::from_top_fraction`]'s semantics.
+    /// Ties in centrality are broken by lower internal index, so the
+    /// result is deterministic given `(graph, samples, top_fraction,
+    /// seed)`.
+    ///
+    /// Pass `samples >= graph.node_count()` for exact betweenness (seed
+    /// then has no effect); pass a smaller `samples` to trade accuracy
+    /// for the `O(samples · (V+E))` runtime.
+    #[must_use]
+    pub fn from_centrality(graph: &Graph, samples: usize, top_fraction: f64, seed: u64) -> Self {
+        let n = graph.node_count();
+        if n == 0 {
+            return Self::empty();
+        }
+        let frac = top_fraction.clamp(0.0, 1.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let k = ((n as f64) * frac).ceil() as usize;
+        let k = k.min(n);
+        if k == 0 {
+            return Self::empty();
+        }
+
+        let scores = crate::betweenness::approximate_betweenness(graph, samples, seed);
+        let mut indexed: Vec<(usize, f64)> = (0..n).map(|i| (i, scores[i])).collect();
+        indexed.sort_by(|a, b| {
+            // Descending by centrality; tie-break ascending by index so
+            // the result is deterministic — same convention as
+            // `from_top_fraction`.
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         indexed.into_iter().take(k).map(|(i, _)| i).collect()
     }
 
@@ -340,6 +395,92 @@ mod tests {
         assert!(
             hubs.contains(top1) && hubs.contains(top2),
             "the two highest-degree nodes must be in the hub set"
+        );
+    }
+
+    /// Issue #23 acceptance criterion: on Zachary, the centrality-based
+    /// hub set must overlap heavily (≥ 80%) with the degree-based one.
+    /// Zachary is the "hubs are high-degree" regime, so the two
+    /// criteria should mostly agree — this guards against a betweenness
+    /// implementation that ranks nonsense.
+    #[test]
+    fn zachary_centrality_hubs_agree_with_degree_hubs() {
+        let src = crate::gml::GmlSource::from_path(
+            "tests/fixtures/karate.gml",
+            &NodeKind::new("member"),
+            &EdgeKind::new("friendship"),
+        )
+        .unwrap();
+        let g = Graph::from_source(&src).unwrap();
+
+        // Compare top-third sets (34 → 12 nodes) for a meaningful
+        // overlap statistic — top-10% (4 nodes) is too small to express
+        // an 80% threshold cleanly.
+        let frac = 1.0 / 3.0;
+        let degree_hubs = HubSet::from_top_fraction(&g, frac);
+        // Exact betweenness (samples >= n) so the test is seed-stable.
+        let centrality_hubs = HubSet::from_centrality(&g, g.node_count(), frac, 0);
+
+        assert_eq!(
+            degree_hubs.len(),
+            centrality_hubs.len(),
+            "both criteria round to the same cut size"
+        );
+        let k = degree_hubs.len();
+        let overlap = centrality_hubs
+            .iter()
+            .filter(|&i| degree_hubs.contains(i))
+            .count();
+        #[allow(clippy::cast_precision_loss)]
+        let agreement = overlap as f64 / k as f64;
+        assert!(
+            agreement >= 0.80,
+            "centrality/degree hub agreement on Zachary was {agreement:.2} ({overlap}/{k}); expected ≥ 0.80"
+        );
+    }
+
+    /// A graph where the two criteria *disagree*: a low-degree bridge
+    /// node between two cliques is a centrality hub but not a degree
+    /// hub. This is the structure that justifies betweenness existing.
+    #[test]
+    fn bridge_node_is_a_centrality_hub_but_not_a_degree_hub() {
+        // Two 5-cliques joined through a single degree-2 bridge node.
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut edges: Vec<Edge> = Vec::new();
+        let kind = EdgeKind::new("e");
+        for _ in 0..10 {
+            nodes.push(Node::fresh(NodeKind::new("clique")));
+        }
+        let bridge = Node::fresh(NodeKind::new("bridge"));
+        // Clique A = 0..5, clique B = 5..10.
+        for (lo, hi) in [(0, 5), (5, 10)] {
+            for i in lo..hi {
+                for j in (i + 1)..hi {
+                    edges.push(Edge::fresh(nodes[i].id, nodes[j].id, kind.clone()));
+                }
+            }
+        }
+        edges.push(Edge::fresh(nodes[0].id, bridge.id, kind.clone()));
+        edges.push(Edge::fresh(nodes[5].id, bridge.id, kind.clone()));
+        nodes.push(bridge.clone());
+
+        let src = SliceSource::new(&nodes, &edges);
+        let g = Graph::from_source(&src).unwrap();
+        let bridge_idx = g.index_of(bridge.id).unwrap();
+
+        // Top single node by each criterion.
+        let degree_hub = HubSet::from_top_fraction(&g, 0.05); // ceil(11*0.05)=1
+        let centrality_hub = HubSet::from_centrality(&g, g.node_count(), 0.05, 0);
+        assert_eq!(degree_hub.len(), 1);
+        assert_eq!(centrality_hub.len(), 1);
+
+        assert!(
+            centrality_hub.contains(bridge_idx),
+            "betweenness must pick the bridge node as the #1 hub"
+        );
+        assert!(
+            !degree_hub.contains(bridge_idx),
+            "degree must NOT pick the (lowest-degree) bridge node"
         );
     }
 }

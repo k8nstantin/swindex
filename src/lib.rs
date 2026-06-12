@@ -50,7 +50,7 @@
 //!   mapping derived by running Leiden on the cluster super-graph
 //!   (recursive Leiden, same trick Microsoft GraphRAG uses offline).
 //! * [`index`] — [`index::SwIndex`], the persisted public face. Wraps a
-//!   Fjall keyspace with nine partitions holding the four-layer
+//!   Fjall keyspace with ten partitions holding the four-layer
 //!   structural metadata. `build_from_source` runs the full Layer-0..3
 //!   pipeline and commits atomically; close + reopen round-trips
 //!   identical answers.
@@ -72,7 +72,8 @@ pub mod sql_dump;
 
 pub use betweenness::approximate_betweenness;
 pub use community::{
-    Partition, leiden, leiden_seeded, louvain, louvain_seeded, modularity, regions_from_clusters,
+    Partition, cluster_adjacency, leiden, leiden_seeded, louvain, louvain_seeded, modularity,
+    regions_from_clusters,
 };
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};

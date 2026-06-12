@@ -27,7 +27,7 @@ A hierarchical small-world property-graph index in Rust. Builds and persists a l
               └──────────────────────────┘
 ```
 
-swindex stores **only structural metadata** (cluster assignments, hub graph, cluster→region mapping, human-readable labels) — backed by a Fjall LSM keyspace with nine partitions. On disk that's typically 2–5% of the size of the underlying data. Your row payloads stay where they live.
+swindex stores **only structural metadata** (cluster assignments, hub graph, cluster→region mapping, human-readable labels) — backed by a Fjall LSM keyspace with ten partitions. On disk that's typically 2–5% of the size of the underlying data. Your row payloads stay where they live.
 
 ### The four layers
 

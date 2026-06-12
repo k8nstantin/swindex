@@ -2,11 +2,12 @@
 //!
 //! # What the hub graph is
 //!
-//! Once [`crate::hub::HubSet`] has identified the ~0.1–5% of nodes that
-//! are structurally pivotal, the hub graph is the **adjacency among
-//! hubs** that the query planner walks for long-range navigation. It
-//! is the literal "highway" referred to in the design doc and the
-//! Dec 2024 "Hubs in HNSW" paper.
+//! Once [`crate::hub::HubSet`] has identified the small fraction of
+//! nodes that are structurally pivotal (design target 0.1–1%; the
+//! shipped build default is 10% pending `SwConfig` tuning), the hub
+//! graph is the **adjacency among hubs** that the query planner walks
+//! for long-range navigation. It is the literal "highway" referred to
+//! in the design doc and the Dec 2024 "Hubs in HNSW" paper.
 //!
 //! # How edges are formed
 //!

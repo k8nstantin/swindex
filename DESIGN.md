@@ -4,6 +4,26 @@ A novel database index that exploits emergent small-world topology to make prope
 
 ---
 
+## Implementation status
+
+**This is the north-star design document, not a description of the shipped code.** It was written before implementation and describes the target system. For shipped behavior, the rustdoc (`src/lib.rs` and module docs) and [`BENCHMARKS.md`](BENCHMARKS.md) are authoritative. The table below maps each design element to its current state; when code and design diverge in a way this table doesn't capture, update the table — don't let silent drift accumulate (see [`CONTRIBUTING.md`](CONTRIBUTING.md) §8).
+
+| Design element | Designed | Shipped today (v0.1.x main) |
+|---|---|---|
+| L1 Leiden clustering | Traag 2019, parallel, resolution-tuned | ✅ Implemented (single-threaded, fixed γ=1) |
+| L2 hub detection | Degree + betweenness + type, 0.1–1% of nodes | Degree + betweenness implemented; **build uses degree only at a 10% default** (SwConfig wiring is v0.2) |
+| L2 hub graph | k-hop BFS adjacency, greedy multi-hop navigation | Adjacency built + persisted; **queries do a one-hop expansion from one entry hub** — no greedy walk yet |
+| L3 region graph | Inter-region adjacency, query routing | Cluster→region partition built + persisted; **no region adjacency, not consulted at query time** |
+| Query API | `query(pattern, opts)`, `query_as_of`, unanchored entry | `QueryKind::{SameCluster, Similar}` anchored at an existing node; no patterns, no time-travel |
+| Build | Parallel, O(N log N), billions of nodes | In-memory, single-threaded, rebuild-only; benchmarked to N=50k |
+| Incremental maintenance | Ada-IVF adaptive re-clustering | Phase-1 scaffolding: `insert_node` majority-vote + drift tracking; only policy is `NeverRebalance` |
+| Storage | Fjall v3 hot + Parquet/Iceberg cold tier | Fjall v2, nine partitions; **no cold tier** |
+| Crate stack | tokio, petgraph, arrow, iceberg, dashmap, … | fjall, serde, tracing, uuid, clap — nothing async, no columnar deps |
+| Module layout | Multi-crate workspace, nested modules | Single crate, flat `src/*.rs` |
+| Measured query scaling | O(log N) typical | **O(cluster_size)** — see BENCHMARKS.md "What the data does and doesn't show" |
+
+---
+
 ## Context
 
 **The problem this solves.** Today's graph databases (Neo4j, IndraDB, Kuzu, Grafeo, ArangoDB, TigerGraph, SurrealDB) store nodes and edges with index-free adjacency and rely on edge-by-edge traversal for queries. They are topology-blind: they treat all edges as equal and do not exploit the structural properties (clustering, hubs, long-range shortcuts) that real-world graphs naturally exhibit. As graphs grow into the hundreds of millions or billions of nodes, query latency degrades because traversal cost grows with edge count, not with the topology of the data.
@@ -325,7 +345,7 @@ It is a synthesis of multiple research threads that none of them addresses alone
 |---|---|
 | Async runtime | `tokio` |
 | Graph primitives | `petgraph`, `graphalgs` |
-| Embedded LSM (hot) | `fjall` v3 |
+| Embedded LSM (hot) | `fjall` (v2 shipped today) |
 | Columnar (cold) | `arrow-rs`, `parquet`, `iceberg-rust` |
 | Object storage | `object_store` |
 | Identity | `uuid` crate (v7) |
@@ -500,11 +520,11 @@ The temptation in projects like this is to bundle the index with one specific ap
 
 1. **The index is general-purpose.** It solves an unsolved problem for any application with billion-scale property-graph workloads. Many verticals can use it.
 2. **Testing benefits from generality.** Validating on synthetic graphs + real-world datasets (SNAP, citation networks, etc.) gives stronger correctness guarantees than testing on one application's data.
-3. **Ecosystem benefits from open release.** Publishing as an open-source Rust crate creates community contributions, bug reports, hardening, and the implicit reputation that comes from being adopted by other projects.
+3. **Ecosystem benefits from open release.** Publishing the source creates community contributions, bug reports, hardening, and the implicit reputation that comes from being adopted by other projects. (Decided: source-available under BSL 1.1, auto-converting to Apache 2.0 four years after each release — see `LICENSE`.)
 4. **Patent/defensibility cleanly maps to the library.** The novelty is in the index design; the application is conventional. Separating them makes the IP picture clearer.
 5. **Application-specific layers stay clean.** Real-estate-specific code (county data ingestion, authority signatures, agent APIs) belongs in a higher layer, not entangled with index internals.
 
-The library is named **swindex** ("small-world index") for clarity. Release as Apache 2.0 or BSL depending on commercial strategy chosen later.
+The library is named **swindex** ("small-world index") for clarity. License decided: BSL 1.1 (source-available, not open source per the BSL's own text), auto-converting to Apache 2.0 four years after each release.
 
 ---
 
@@ -517,7 +537,7 @@ The library is named **swindex** ("small-world index") for clarity. Release as A
 5. **Implement `swindex-core::SwIndex`.** Wire everything together. Public API as specified above.
 6. **Validation suite.** Correctness tests on reference graphs; performance benchmarks; workload simulation.
 7. **Documentation.** README, design doc (this file), API docs, examples.
-8. **Open-source release** (or BSL — TBD). Submit to crates.io.
+8. **Public release** (decided: BSL 1.1 source-available). Submit to crates.io.
 
 Estimated effort: **6–10 weeks for one experienced Rust engineer** to ship a usable v0.1 of the standalone library.
 
@@ -547,7 +567,7 @@ SWINDEX LIBRARY  (this design)
         ▼  (uses)
 FOUNDATION CRATES
   • Apache Arrow + Parquet + Iceberg-rust
-  • Fjall v3
+  • Fjall (v2 shipped today)
   • object_store
   • petgraph
 ```

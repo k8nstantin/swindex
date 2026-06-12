@@ -3,10 +3,11 @@
 //! # What this module ships
 //!
 //! [`SwIndex`] — the on-disk, query-time face of the four-layer
-//! architecture. It wraps a Fjall keyspace with seven partitions
+//! architecture. It wraps a Fjall keyspace with nine partitions
 //! ("keyspaces" in the design doc's vocabulary) that hold the
-//! structural metadata produced by Layers 0–3 plus the incremental-
-//! maintenance bookkeeping added in Phase 1 (issue #52):
+//! structural metadata produced by Layers 0–3, the label lookup
+//! tables (issue #55), and the incremental-maintenance bookkeeping
+//! added in Phase 1 (issue #52):
 //!
 //! | Partition | Key | Value | Purpose |
 //! |-----------|-----|-------|---------|
@@ -17,6 +18,8 @@
 //! | `cluster_members` | `ClusterId` (u32 LE) | length-prefixed `Vec<Uuid7>` | "Who's in this cluster?" |
 //! | `cluster_meta`    | `ClusterId` (u32 LE) | `{size: u32, hub_count: u32}` (8 B) | Size + hub count per cluster |
 //! | `cluster_drift`   | `ClusterId` (u32 LE) | `{generation: u64, delta_inserts: u32}` (12 B) | Per-cluster insert pressure since last rebuild (Phase 1) |
+//! | `labels`          | `Uuid7` (16 B) | `FORMAT_V1` + UTF-8 string | Human-readable name per node (e.g. `db.table`) |
+//! | `label_to_uuid`   | UTF-8 string   | `Uuid7` (16 B) | Reverse lookup for name-based queries |
 //!
 //! # On-disk footprint
 //!
@@ -90,9 +93,12 @@ use tracing::{debug, debug_span, info, info_span};
 use uuid::Uuid;
 
 // Default fraction of nodes flagged as hubs by `build_from_source`.
-// 10% is a reasonable starting point per the design doc's 0.1–5% range
-// for graphs at academic-fixture scale; production tuning lives at the
-// caller via a future `SwConfig` parameter.
+// 10% is an interim default chosen so tiny academic fixtures (Zachary:
+// 34 nodes) still yield a usable hub set — it is 10–100× the design
+// target (`DESIGN.md` says 0.1–1%; `from_top_fraction`'s documented
+// operational range tops out at 5%). Production tuning lives at the
+// caller via a future `SwConfig` parameter (tracked with the
+// betweenness build-wiring work).
 const DEFAULT_HUB_FRACTION: f64 = 0.10;
 // Hub-graph k_hop default. Per `DESIGN.md` line 102.
 const DEFAULT_HUB_GRAPH_K_HOP: usize = 3;
@@ -1267,7 +1273,7 @@ impl fmt::Debug for SwIndex {
         // Compact summary — we don't dump the keyspace contents in
         // panic output; that would be enormous.
         f.debug_struct("SwIndex")
-            .field("partitions", &6_usize)
+            .field("partitions", &9_usize)
             .finish()
     }
 }

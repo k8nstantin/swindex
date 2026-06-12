@@ -19,9 +19,12 @@
 //!   is the headline build-cost number; the design claim is `O(N log N)`
 //!   amortized.
 //! * **`query_similar`** — `SwIndex::query(QueryKind::Similar { limit: 25 })`
-//!   on a pre-built index. Limit chosen larger than a single
-//!   cluster's size so the hub-graph expansion path fires. The
-//!   design claim is `O(log N)` typical.
+//!   on a pre-built index. NOTE: with K_CLUSTERS = 10, every size's
+//!   clusters (~N/10 members) far exceed limit = 25, so these queries
+//!   are answered entirely from the seed's cluster (hubs_visited = 0)
+//!   — this group measures the cluster-lookup + members-fetch path,
+//!   NOT hub-graph expansion. See BENCHMARKS.md for the implications
+//!   against the `O(log N)` design claim.
 //!
 //! # Sizes
 //!
@@ -182,9 +185,11 @@ fn bench_swindex_build(c: &mut Criterion) {
 }
 
 /// `query_similar` — pre-build a SwIndex once per size, then time the
-/// `Similar` query. The limit (25) is chosen so on graphs with ~K=10
-/// clusters of N/10 nodes each, the query has to walk the hub graph
-/// for sizes where N/K < 25.
+/// `Similar` query. With K=10 clusters of ~N/10 nodes each, N/K is
+/// 100/1,000/5,000 at the benchmarked sizes — always ≥ limit=25, so
+/// the query never leaves the seed's cluster and the hub-graph
+/// expansion path never fires here. (It fires on Zachary below,
+/// whose clusters of 5–12 members are smaller than the limit.)
 fn bench_query_similar(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_similar");
     group.measurement_time(Duration::from_secs(8));

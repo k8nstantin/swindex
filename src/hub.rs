@@ -216,6 +216,24 @@ impl HubSet {
         Self { hubs }
     }
 
+    /// The set union of two hub sets.
+    ///
+    /// This is how the design doc's multi-criteria hub detection
+    /// composes (`DESIGN.md` "Construction algorithm" step 1: a node
+    /// is a hub if it passes the degree threshold *or* the centrality
+    /// threshold): the busy nodes from [`Self::from_top_fraction`]
+    /// plus the bridge nodes from [`Self::from_centrality`], each
+    /// criterion contributing the nodes only it can see. The result
+    /// can be up to twice either input's size; on graphs where the
+    /// criteria agree (hubs are simply high-degree) it stays close to
+    /// the larger input.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            hubs: self.hubs.union(&other.hubs).copied().collect(),
+        }
+    }
+
     /// `true` iff the given internal node index is a hub in this set.
     #[must_use]
     pub fn contains(&self, node_idx: usize) -> bool {
@@ -482,5 +500,19 @@ mod tests {
             !degree_hub.contains(bridge_idx),
             "degree must NOT pick the (lowest-degree) bridge node"
         );
+
+        // Union: the design doc's composite criterion. Must contain
+        // both criteria's picks — the busy clique node AND the bridge
+        // — and nothing else (here the two singleton sets are
+        // disjoint, so the union has exactly 2 members).
+        let union = degree_hub.union(&centrality_hub);
+        assert_eq!(union.len(), 2);
+        assert!(union.contains(bridge_idx));
+        for h in degree_hub.iter() {
+            assert!(union.contains(h));
+        }
+        // Union with self is identity; union with empty is identity.
+        assert_eq!(union.union(&union), union);
+        assert_eq!(union.union(&HubSet::empty()), union);
     }
 }

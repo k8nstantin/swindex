@@ -11,7 +11,7 @@ A novel database index that exploits emergent small-world topology to make prope
 | Design element | Designed | Shipped today (v0.1.x main) |
 |---|---|---|
 | L1 Leiden clustering | Traag 2019, parallel, resolution-tuned | ✅ Implemented (single-threaded, fixed γ=1) |
-| L2 hub detection | Degree + betweenness + type, 0.1–1% of nodes | Degree + betweenness implemented; **build uses degree only at a 10% default** (SwConfig wiring is v0.2) |
+| L2 hub detection | Degree + betweenness + type, 0.1–1% of nodes | Degree + betweenness implemented; build defaults to the degree ∪ betweenness composite via `SwConfig` (10% per criterion — fixture-scale interim; no type-based criterion yet) |
 | L2 hub graph | k-hop BFS adjacency, greedy multi-hop navigation | Adjacency built + persisted; **queries do a one-hop expansion from one entry hub** — no greedy walk yet |
 | L3 region graph | Inter-region adjacency, query routing | Cluster→region partition built + persisted; **no region adjacency, not consulted at query time** |
 | Query API | `query(pattern, opts)`, `query_as_of`, unanchored entry | `QueryKind::{SameCluster, Similar}` anchored at an existing node; no patterns, no time-travel |

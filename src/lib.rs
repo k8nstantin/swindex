@@ -58,6 +58,7 @@
 pub mod betweenness;
 pub mod community;
 pub mod corridor;
+pub mod edgelist;
 pub mod gml;
 pub mod graph;
 pub mod hub;
@@ -77,6 +78,7 @@ pub use community::{
     regions_from_clusters,
 };
 pub use corridor::{CorridorReport, bfs_distance, cluster_corridor, evaluate_corridor};
+pub use edgelist::{EdgeListError, EdgeListSource};
 pub use gml::{GmlError, GmlSource};
 pub use graph::{Graph, GraphError};
 pub use hub::HubSet;
